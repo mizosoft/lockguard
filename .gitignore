@@ -1,0 +1,6 @@
+*.test
+/build/
+/bin/
+*.out
+.idea/
+./TODO
