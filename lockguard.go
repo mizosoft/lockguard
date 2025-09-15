@@ -21,13 +21,14 @@ var Analyzer = &analysis.Analyzer{
 }
 
 type protectedBy struct {
-	expr string
+	// TODO we want this to eventually work on arbitrary expressions.
+	lock *types.Var
 }
 
 func (p *protectedBy) AFact() {}
 
 func (p *protectedBy) String() string {
-	return fmt.Sprintf("protected_by:\"%s\"", p.expr)
+	return fmt.Sprintf("protected_by:\"%s\"", p.lock.Name())
 }
 
 func run(pass *analysis.Pass) (interface{}, error) {
@@ -40,7 +41,8 @@ func run(pass *analysis.Pass) (interface{}, error) {
 		return nil, nil
 	}
 
-	protections := map[*types.Var]string{}
+	// Maps var objects in structs to var objects with type sync.Mutex that should protect them.
+	protections := make(map[*types.Var]*types.Var)
 
 	// Scan the tree for lock protections.
 	ins.Preorder([]ast.Node{(*ast.GenDecl)(nil)}, func(n ast.Node) {
@@ -55,22 +57,47 @@ func run(pass *analysis.Pass) (interface{}, error) {
 				continue
 			}
 
+			// TODO make this work for embedded types.
+
+			// Find sync.Mutex fields in this struct.
+			lockFields := make(map[string]*types.Var)
+			for _, field := range structType.Fields.List {
+				if fieldType, isNamed := pass.TypesInfo.TypeOf(field.Type).(*types.Named); isNamed {
+					if fieldType.String() == "sync.Mutex" {
+						// This is a sync.Mutex field. TODO is this check enough? Can't we have a similarly named type?
+						for _, name := range field.Names {
+							if obj := pass.TypesInfo.ObjectOf(name); obj != nil {
+								if varObj, isVar := obj.(*types.Var); isVar {
+									lockFields[name.Name] = varObj
+								}
+							}
+						}
+					}
+				}
+			}
+
 			for _, field := range structType.Fields.List {
 				if field.Tag != nil {
-					protectedByExpr, ok := reflect.StructTag(strings.Trim(field.Tag.Value, "`")).Lookup("protected_by")
+					protectedByFieldName, ok := reflect.StructTag(strings.Trim(field.Tag.Value, "`")).Lookup("protected_by")
 					if !ok {
 						continue
+					}
+
+					lockVar, lockExists := lockFields[protectedByFieldName]
+					if !lockExists {
+						pass.Reportf(field.Pos(), "No sync.Mutex field with name <%s> exists", protectedByFieldName)
+						return
 					}
 
 					for _, name := range field.Names {
 						if obj := pass.TypesInfo.ObjectOf(name); obj != nil {
 							if varObj, isVar := obj.(*types.Var); isVar {
-								protections[varObj] = protectedByExpr
+								protections[varObj] = lockVar
 								//fmt.Printf("%s is protected by %s\n", varObj.Origin(), protectedByExpr)
 
 								// Export protection info as a fact to other packages.
 								if name.IsExported() {
-									pass.ExportObjectFact(varObj, &protectedBy{expr: protectedByExpr})
+									pass.ExportObjectFact(varObj, &protectedBy{lock: lockVar})
 								}
 							}
 						}
@@ -85,8 +112,8 @@ func run(pass *analysis.Pass) (interface{}, error) {
 		if exprType := pass.TypesInfo.TypeOf(selectorExpr.X); exprType != nil {
 			if obj := pass.TypesInfo.ObjectOf(selectorExpr.Sel); obj != nil {
 				if varObj, isVar := obj.(*types.Var); isVar {
-					if protection, isProtected := protections[varObj]; isProtected {
-						fmt.Printf("%s is protected by %s\n", varObj.Origin(), protection)
+					if lockVar, isProtected := protections[varObj]; isProtected {
+						fmt.Printf("%s is protected by %s\n", varObj, lockVar)
 					}
 				}
 			}
