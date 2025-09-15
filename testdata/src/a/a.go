@@ -20,4 +20,9 @@ func Func() {
 		i int `protected_by:"mu"`
 	}{i: 1}
 	fmt.Println(v)
+
+	s1 := S1{i: 1}
+	fmt.Println(s1.i)
+
+	fmt.Println(S2{i: 1}.i)
 }

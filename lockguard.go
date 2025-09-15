@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"go/ast"
+	"go/types"
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/inspect"
 	"golang.org/x/tools/go/ast/inspector"
@@ -30,15 +31,20 @@ func (p *protectedBy) String() string {
 }
 
 func run(pass *analysis.Pass) (interface{}, error) {
+	if pass.Pkg.Name() != "a" {
+		return nil, nil
+	}
+
 	ins, ok := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 	if !ok {
 		return nil, nil
 	}
 
+	protections := map[*types.Var]string{}
+
 	// Scan the tree for lock protections.
 	ins.Preorder([]ast.Node{(*ast.GenDecl)(nil)}, func(n ast.Node) {
-		genDecl := n.(*ast.GenDecl)
-		for _, spec := range genDecl.Specs {
+		for _, spec := range n.(*ast.GenDecl).Specs {
 			typeSpec, ok := spec.(*ast.TypeSpec)
 			if !ok {
 				continue
@@ -50,29 +56,41 @@ func run(pass *analysis.Pass) (interface{}, error) {
 			}
 
 			for _, field := range structType.Fields.List {
-				protectedByExpr, ok := reflect.StructTag(strings.Trim(field.Tag.Value, "`")).Lookup("protected_by")
-				if !ok {
-					continue
-				}
-
-				for _, name := range field.Names {
-					obj := pass.TypesInfo.ObjectOf(name)
-					if obj == nil {
+				if field.Tag != nil {
+					protectedByExpr, ok := reflect.StructTag(strings.Trim(field.Tag.Value, "`")).Lookup("protected_by")
+					if !ok {
 						continue
 					}
 
-					// Export protection info to other packages.
-					if name.IsExported() {
-						pass.ExportObjectFact(obj, &protectedBy{expr: protectedByExpr})
+					for _, name := range field.Names {
+						if obj := pass.TypesInfo.ObjectOf(name); obj != nil {
+							if varObj, isVar := obj.(*types.Var); isVar {
+								protections[varObj] = protectedByExpr
+								//fmt.Printf("%s is protected by %s\n", varObj.Origin(), protectedByExpr)
+
+								// Export protection info as a fact to other packages.
+								if name.IsExported() {
+									pass.ExportObjectFact(varObj, &protectedBy{expr: protectedByExpr})
+								}
+							}
+						}
 					}
 				}
 			}
 		}
+	})
 
-		// Scan to check accesses.
-		ins.Preorder([]ast.Node{(*ast.GenDecl)(nil)}, func(n ast.Node) {
-
-		})
+	ins.Preorder([]ast.Node{(*ast.SelectorExpr)(nil)}, func(n ast.Node) {
+		selectorExpr := n.(*ast.SelectorExpr)
+		if exprType := pass.TypesInfo.TypeOf(selectorExpr.X); exprType != nil {
+			if obj := pass.TypesInfo.ObjectOf(selectorExpr.Sel); obj != nil {
+				if varObj, isVar := obj.(*types.Var); isVar {
+					if protection, isProtected := protections[varObj]; isProtected {
+						fmt.Printf("%s is protected by %s\n", varObj.Origin(), protection)
+					}
+				}
+			}
+		}
 	})
 
 	return nil, nil
