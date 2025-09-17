@@ -55,18 +55,15 @@ func run(pass *analysis.Pass) (interface{}, error) {
 }
 
 type lockAnalyzer struct {
-	protections map[*types.Var]*types.Var
+	protections map[types.Object]*types.Var
 	heldLocks   map[*types.Var][]ast.Expr
 }
 
 // TODO handle global vars when we allow protection specs by comments.
 func (l *lockAnalyzer) analyzeStmt(pass *analysis.Pass, stmt ast.Stmt) {
 	switch stmt := stmt.(type) {
-	case *ast.BadStmt:
-		// Skip.
 	case *ast.DeclStmt:
 		l.analyzeDecl(pass, stmt.Decl)
-	case *ast.EmptyStmt:
 	case *ast.LabeledStmt:
 		l.analyzeStmt(pass, stmt.Stmt)
 	case *ast.ExprStmt:
@@ -85,8 +82,6 @@ func (l *lockAnalyzer) analyzeStmt(pass *analysis.Pass, stmt ast.Stmt) {
 		l.analyzeExpr(pass, stmt.Call, nil)
 	case *ast.ReturnStmt:
 		l.analyzeExprs(pass, stmt.Results)
-	case *ast.BranchStmt:
-		// Skip
 	case *ast.BlockStmt:
 		for _, stmt := range stmt.List {
 			l.analyzeStmt(pass, stmt)
@@ -124,15 +119,13 @@ func (l *lockAnalyzer) analyzeStmt(pass *analysis.Pass, stmt ast.Stmt) {
 	case *ast.RangeStmt:
 		l.analyzeExpr(pass, stmt.X, nil)
 		l.analyzeStmt(pass, stmt.Body)
-	default:
+	case *ast.BadStmt, *ast.EmptyStmt, *ast.BranchStmt:
 		// Skip
 	}
 }
 
 func (l *lockAnalyzer) analyzeDecl(pass *analysis.Pass, decl ast.Decl) {
 	switch decl := decl.(type) {
-	case *ast.BadDecl:
-		// Skip
 	case *ast.FuncDecl:
 		// TODO we need to have the receiver as context.
 		l.analyzeStmt(pass, decl.Body)
@@ -144,7 +137,7 @@ func (l *lockAnalyzer) analyzeDecl(pass *analysis.Pass, decl ast.Decl) {
 				}
 			}
 		}
-	default:
+	case *ast.BadDecl:
 		// Skip
 	}
 }
@@ -157,8 +150,6 @@ func (l *lockAnalyzer) analyzeExprs(pass *analysis.Pass, exprs []ast.Expr) {
 
 func (l *lockAnalyzer) analyzeExpr(pass *analysis.Pass, expr ast.Expr, parent ast.Expr) {
 	switch expr := expr.(type) {
-	case *ast.BadExpr:
-		// Skip
 	case *ast.Ident:
 		if varObj, ok := pass.TypesInfo.ObjectOf(expr).(*types.Var); ok {
 			if lockVar, ok := l.protections[varObj]; ok {
@@ -175,8 +166,6 @@ func (l *lockAnalyzer) analyzeExpr(pass *analysis.Pass, expr ast.Expr, parent as
 		}
 	case *ast.Ellipsis:
 		l.analyzeExpr(pass, expr.Elt, expr)
-	case *ast.BasicLit:
-		// Skip
 	case *ast.FuncLit:
 		l.analyzeStmt(pass, expr.Body)
 	case *ast.CompositeLit:
@@ -210,10 +199,23 @@ func (l *lockAnalyzer) analyzeExpr(pass *analysis.Pass, expr ast.Expr, parent as
 
 		// Check if this call is a Lock() call.
 		if funcSelector, isSelector := expr.Fun.(*ast.SelectorExpr); isSelector {
-			if exprType := pass.TypesInfo.TypeOf(funcSelector.X); exprType != nil && exprType.String() == "sync.Mutex" && funcSelector.Sel.Name == "Lock" {
+			if exprType := pass.TypesInfo.TypeOf(funcSelector.X); exprType != nil && exprType.String() == "sync.Mutex" {
 				if lockSelector, ok := funcSelector.X.(*ast.SelectorExpr); ok {
-					if varObj := pass.TypesInfo.ObjectOf(lockSelector.Sel).(*types.Var); varObj != nil {
-						l.heldLocks[varObj] = append(l.heldLocks[varObj], lockSelector.X)
+					if lockVar := pass.TypesInfo.ObjectOf(lockSelector.Sel).(*types.Var); lockVar != nil {
+						if funcSelector.Sel.Name == "Lock" {
+							fmt.Println("Locking", lockVar)
+							l.heldLocks[lockVar] = append(l.heldLocks[lockVar], lockSelector.X)
+						} else if funcSelector.Sel.Name == "Unlock" {
+							var updatedExprs []ast.Expr
+							for _, holdingExpr := range l.heldLocks[lockVar] {
+								if !expressionsMatch(pass, lockSelector.X, holdingExpr) {
+									updatedExprs = append(updatedExprs, holdingExpr)
+								} else {
+									fmt.Println("Unlocking", lockVar)
+								}
+							}
+							l.heldLocks[lockVar] = updatedExprs
+						}
 					}
 				}
 			}
@@ -232,14 +234,14 @@ func (l *lockAnalyzer) analyzeExpr(pass *analysis.Pass, expr ast.Expr, parent as
 	case *ast.KeyValueExpr:
 		// We're not interested in the key.
 		l.analyzeExpr(pass, expr.Value, expr)
-	default:
+	case *ast.BasicLit, *ast.BadExpr:
 		// Skip
 	}
 }
 
 // Gather protection information from struct declarations.
-func findProtections(pass *analysis.Pass, ins *inspector.Inspector) map[*types.Var]*types.Var {
-	protections := make(map[*types.Var]*types.Var)
+func findProtections(pass *analysis.Pass, ins *inspector.Inspector) map[types.Object]*types.Var {
+	protections := make(map[types.Object]*types.Var)
 
 	// Scan the tree for lock protections.
 	ins.Preorder([]ast.Node{(*ast.GenDecl)(nil)}, func(n ast.Node) {
@@ -280,6 +282,8 @@ func findProtections(pass *analysis.Pass, ins *inspector.Inspector) map[*types.V
 					if !ok {
 						continue
 					}
+
+					// TODO make this work for arbitrary expressions.
 
 					lockVar, lockExists := lockFields[protectedByFieldName]
 					if !lockExists {

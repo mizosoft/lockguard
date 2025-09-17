@@ -46,4 +46,6 @@ func Func() {
 
 	temp.s1.mut.Lock()
 	temp.s1.i = 1
+	temp.s1.mut.Unlock()
+	temp.s1.i = 3
 }
