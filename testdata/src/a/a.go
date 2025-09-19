@@ -1,51 +1,29 @@
 package a
 
-import (
-	"fmt"
-	"sync"
-)
+import "sync"
 
 type S1 struct {
 	i   int `protected_by:"mut"`
 	mut sync.Mutex
 }
 
-type S2 = struct {
-	i   int `protected_by:"mut"`
-	mut sync.Mutex
+type AS1 = S1
+
+type S2 struct {
+	s1 AS1
+	i  int `protected_by:"s1.mut"`
 }
 
-type S3 = struct {
-	i, j, k int `protected_by:"mut"`
-	mut     sync.Mutex
+type AS2 = S2
+
+type AS2_1 = AS2
+
+type S3 struct {
+	s2 AS2_1
+	i  int `protected_by:"s2.s1.mut"`
 }
 
 // Func This is a function
 func Func() {
-	type S3 struct {
-		i   string `protected_by:"mut"`
-		mut sync.Mutex
-	}
 
-	//v := struct {
-	//	i int `protected_by:"mut"`
-	//}{i: 1}
-	//fmt.Println(v)
-
-	s1 := S1{i: 1}
-	fmt.Println(s1.i)
-
-	fmt.Println(S2{i: 1}.i)
-
-	fmt.Println(S3{i: ""}.i)
-
-	var temp = struct {
-		s1 S1
-		i  int
-	}{}
-
-	temp.s1.mut.Lock()
-	temp.s1.i = 1
-	temp.s1.mut.Unlock()
-	temp.s1.i = 3
 }

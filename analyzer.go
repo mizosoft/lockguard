@@ -3,6 +3,8 @@ package main
 import (
 	"fmt"
 	"go/ast"
+	"go/importer"
+	"go/parser"
 	"go/token"
 	"go/types"
 	"reflect"
@@ -15,7 +17,7 @@ import (
 
 // Analyzer Checks lock-protected accesses.
 var Analyzer = &analysis.Analyzer{
-	Name:      "astcheck",
+	Name:      "lockguard",
 	Doc:       "Checks lock-protected accesses",
 	Run:       run,
 	Requires:  []*analysis.Analyzer{inspect.Analyzer},
@@ -32,23 +34,44 @@ func (p *protectedBy) String() string {
 	return fmt.Sprintf("protected_by:\"%s\"", p.lock.Name())
 }
 
+var lockerType *types.Interface
+
 func run(pass *analysis.Pass) (interface{}, error) {
 	if pass.Pkg.Name() != "a" {
 		return nil, nil
 	}
 
-	ins, ok := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
-	if !ok {
-		return nil, nil
+	// Load sync package to get the Locker interface
+	imp := importer.Default()
+	syncPkg, err := imp.Import("sync")
+	if err != nil {
+		return nil, err
 	}
+
+	obj := syncPkg.Scope().Lookup("Locker")
+	if typeName, ok := obj.(*types.TypeName); ok {
+		if named, ok := typeName.Type().(*types.Named); ok {
+			if iface, ok := named.Underlying().(*types.Interface); ok {
+				lockerType = iface
+			}
+		}
+	}
+
+	if lockerType == nil {
+		return nil, fmt.Errorf("unable to find sync.Locker interface type")
+	}
+
+	ins := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
+
+	f := &protectionsFinder{protections: make(map[types.Object]*types.Var)}
+	f.find(pass, ins)
 
 	l := &lockAnalyzer{
-		protections: findProtections(pass, ins),
-		heldLocks:   map[*types.Var][]ast.Expr{},
+		protections: f.protections,
+		heldLocks:   make(map[*types.Var][]ast.Expr),
 	}
-
-	ins.Preorder([]ast.Node{(*ast.FuncDecl)(nil)}, func(n ast.Node) {
-		l.analyzeDecl(pass, n.(*ast.FuncDecl))
+	ins.Preorder([]ast.Node{(ast.Decl)(nil)}, func(node ast.Node) {
+		l.analyzeDecl(pass, node.(ast.Decl))
 	})
 
 	return nil, nil
@@ -239,78 +262,6 @@ func (l *lockAnalyzer) analyzeExpr(pass *analysis.Pass, expr ast.Expr, parent as
 	}
 }
 
-// Gather protection information from struct declarations.
-func findProtections(pass *analysis.Pass, ins *inspector.Inspector) map[types.Object]*types.Var {
-	protections := make(map[types.Object]*types.Var)
-
-	// Scan the tree for lock protections.
-	ins.Preorder([]ast.Node{(*ast.GenDecl)(nil)}, func(n ast.Node) {
-		for _, spec := range n.(*ast.GenDecl).Specs {
-			typeSpec, ok := spec.(*ast.TypeSpec)
-			if !ok {
-				continue
-			}
-
-			structType, ok := typeSpec.Type.(*ast.StructType)
-			if !ok {
-				continue
-			}
-
-			// TODO make this work for embedded types.
-
-			// Find sync.Mutex fields in this struct.
-			lockFields := map[string]*types.Var{}
-			for _, field := range structType.Fields.List {
-				if fieldType, isNamed := pass.TypesInfo.TypeOf(field.Type).(*types.Named); isNamed {
-					if fieldType.String() == "sync.Mutex" {
-						// This is a sync.Mutex field.
-						// TODO is this check enough? Can't we have a similarly named type?
-						for _, name := range field.Names {
-							if obj := pass.TypesInfo.ObjectOf(name); obj != nil {
-								if varObj, isVar := obj.(*types.Var); isVar {
-									lockFields[name.Name] = varObj
-								}
-							}
-						}
-					}
-				}
-			}
-
-			for _, field := range structType.Fields.List {
-				if field.Tag != nil {
-					protectedByFieldName, ok := reflect.StructTag(strings.Trim(field.Tag.Value, "`")).Lookup("protected_by")
-					if !ok {
-						continue
-					}
-
-					// TODO make this work for arbitrary expressions.
-
-					lockVar, lockExists := lockFields[protectedByFieldName]
-					if !lockExists {
-						pass.Reportf(field.Pos(), "No sync.Mutex field with name <%s> exists", protectedByFieldName)
-						return
-					}
-
-					for _, name := range field.Names {
-						if obj := pass.TypesInfo.ObjectOf(name); obj != nil {
-							if varObj, isVar := obj.(*types.Var); isVar {
-								protections[varObj] = lockVar
-
-								// Export protection info as a fact to other packages.
-								if name.IsExported() {
-									pass.ExportObjectFact(varObj, &protectedBy{lock: lockVar})
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-	})
-
-	return protections
-}
-
 func expressionsMatch(pass *analysis.Pass, left ast.Expr, right ast.Expr) bool {
 	if left == nil && right == nil {
 		return true
@@ -406,4 +357,97 @@ func expressionListMatches(pass *analysis.Pass, lefts []ast.Expr, rights []ast.E
 		}
 	}
 	return true
+}
+
+type protectionsFinder struct {
+	protections map[types.Object]*types.Var
+}
+
+func (f *protectionsFinder) find(pass *analysis.Pass, ins *inspector.Inspector) {
+	ins.Preorder([]ast.Node{(*ast.StructType)(nil)}, func(n ast.Node) {
+		structType := n.(*ast.StructType)
+
+		strct, ok := pass.TypesInfo.TypeOf(structType).(*types.Struct)
+		if !ok {
+			return
+		}
+
+		for _, field := range structType.Fields.List {
+			if field.Tag != nil {
+				protectedByValue, ok := reflect.StructTag(strings.Trim(field.Tag.Value, "`")).Lookup("protected_by")
+				if !ok {
+					continue
+				}
+
+				lockExpr, err := parser.ParseExpr(protectedByValue)
+				if err != nil {
+					pass.Reportf(field.Tag.ValuePos, "couldn't parse protected_by expression: %v", err)
+					continue
+				}
+
+				lockVar := findLockVar(strct, lockExpr)
+				if lockVar == nil {
+					pass.Reportf(field.Tag.ValuePos, "expression doesn't locate a lock field")
+					continue
+				}
+
+				if !types.Implements(lockVar.Type(), lockerType) && !types.Implements(types.NewPointer(lockVar.Type()), lockerType) {
+					pass.Reportf(field.Tag.ValuePos, "value referred to by expression doesn't implement sync.Locker")
+					continue
+				}
+
+				for _, name := range field.Names {
+					if vr, ok := pass.TypesInfo.ObjectOf(name).(*types.Var); vr != nil && ok {
+						f.protections[vr] = lockVar
+
+						// Export protection info as a fact to other packages.
+						//if name.IsExported() {
+						//pass.ExportObjectFact(vr, &protectedBy{lock: lockVar})
+						//}
+					}
+				}
+			}
+		}
+	})
+}
+
+// TODO make this work for function expressions, global lock variables (global context) & embedded fields.
+func findLockVar(context *types.Struct, expr ast.Expr) *types.Var {
+	switch expr := expr.(type) {
+	case *ast.SelectorExpr:
+		return findField(findLockVarContext(context, expr.X), expr.Sel.Name)
+	case *ast.Ident:
+		return findField(context, expr.Name)
+	}
+	return nil
+}
+
+func findLockVarContext(rootContext *types.Struct, expr ast.Expr) *types.Struct {
+	switch expr := expr.(type) {
+	case *ast.SelectorExpr:
+		if parentContext := findLockVarContext(rootContext, expr.X); parentContext != nil {
+			return findFieldStructType(parentContext, expr.Sel.Name)
+		}
+	case *ast.Ident:
+		return findFieldStructType(rootContext, expr.Name)
+	}
+	return nil
+}
+
+func findFieldStructType(context *types.Struct, name string) *types.Struct {
+	if field := findField(context, name); field != nil {
+		if strct, ok := field.Type().Underlying().(*types.Struct); ok {
+			return strct
+		}
+	}
+	return nil
+}
+
+func findField(context *types.Struct, name string) *types.Var {
+	for field := range context.Fields() {
+		if field.Name() == name {
+			return field
+		}
+	}
+	return nil
 }
