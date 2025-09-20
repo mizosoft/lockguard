@@ -68,95 +68,71 @@ func run(pass *analysis.Pass) (interface{}, error) {
 
 	l := &lockAnalyzer{
 		protections: f.protections,
-		heldLocks:   make(map[*types.Var][]ast.Expr),
+		locks:       make(map[*types.Var][]*ast.SelectorExpr),
+		pass:        pass,
+		stack:       make([]ast.Node, 0),
 	}
-	ins.Preorder([]ast.Node{(ast.Decl)(nil)}, func(node ast.Node) {
-		l.analyzeDecl(pass, node.(ast.Decl))
+	ins.Preorder([]ast.Node{(*ast.FuncDecl)(nil), (*ast.GenDecl)(nil), (*ast.BadDecl)(nil)}, func(node ast.Node) {
+		l.analyzeDecl(node.(ast.Decl))
 	})
 
 	return nil, nil
 }
 
 type lockAnalyzer struct {
-	protections map[types.Object]*types.Var
-	heldLocks   map[*types.Var][]ast.Expr
+	protections     map[types.Object]*types.Var
+	locks           map[*types.Var][]*ast.SelectorExpr
+	deferredUnlocks []map[*types.Var]bool
+	pass            *analysis.Pass
+	stack           []ast.Node
 }
 
-// TODO handle global vars when we allow protection specs by comments.
-func (l *lockAnalyzer) analyzeStmt(pass *analysis.Pass, stmt ast.Stmt) {
-	switch stmt := stmt.(type) {
-	case *ast.DeclStmt:
-		l.analyzeDecl(pass, stmt.Decl)
-	case *ast.LabeledStmt:
-		l.analyzeStmt(pass, stmt.Stmt)
-	case *ast.ExprStmt:
-		l.analyzeExpr(pass, stmt.X, nil)
-	case *ast.SendStmt:
-		l.analyzeExpr(pass, stmt.Chan, nil)
-		l.analyzeExpr(pass, stmt.Value, nil)
-	case *ast.IncDecStmt:
-		l.analyzeExpr(pass, stmt.X, nil)
-	case *ast.AssignStmt:
-		l.analyzeExprs(pass, stmt.Lhs)
-		l.analyzeExprs(pass, stmt.Rhs)
-	case *ast.GoStmt:
-		l.analyzeExpr(pass, stmt.Call, nil)
-	case *ast.DeferStmt:
-		l.analyzeExpr(pass, stmt.Call, nil)
-	case *ast.ReturnStmt:
-		l.analyzeExprs(pass, stmt.Results)
-	case *ast.BlockStmt:
-		for _, stmt := range stmt.List {
-			l.analyzeStmt(pass, stmt)
+func nillOf[T any]() T {
+	var t T
+	return t
+}
+
+func closest[N ast.Node](l *lockAnalyzer) (N, bool) {
+	ln := len(l.stack)
+	for i := ln - 2; i >= 0; i-- {
+		if typedNode, ok := l.stack[i].(N); ok {
+			return typedNode, true
 		}
-	case *ast.IfStmt:
-		l.analyzeStmt(pass, stmt.Init)
-		l.analyzeExpr(pass, stmt.Cond, nil)
-		l.analyzeStmt(pass, stmt.Body)
-		l.analyzeStmt(pass, stmt.Else)
-	case *ast.CaseClause:
-		l.analyzeExprs(pass, stmt.List)
-		for _, innerStmt := range stmt.Body {
-			l.analyzeStmt(pass, innerStmt)
-		}
-	case *ast.SwitchStmt:
-		l.analyzeStmt(pass, stmt.Init)
-		l.analyzeExpr(pass, stmt.Tag, nil)
-		l.analyzeStmt(pass, stmt.Body)
-	case *ast.TypeSwitchStmt:
-		l.analyzeStmt(pass, stmt.Init)
-		l.analyzeStmt(pass, stmt.Assign)
-		l.analyzeStmt(pass, stmt.Body)
-	case *ast.CommClause:
-		l.analyzeStmt(pass, stmt.Comm)
-		for _, innerStmt := range stmt.Body {
-			l.analyzeStmt(pass, innerStmt)
-		}
-	case *ast.SelectStmt:
-		l.analyzeStmt(pass, stmt.Body)
-	case *ast.ForStmt:
-		l.analyzeStmt(pass, stmt.Init)
-		l.analyzeExpr(pass, stmt.Cond, nil)
-		l.analyzeStmt(pass, stmt.Post)
-		l.analyzeStmt(pass, stmt.Body)
-	case *ast.RangeStmt:
-		l.analyzeExpr(pass, stmt.X, nil)
-		l.analyzeStmt(pass, stmt.Body)
-	case *ast.BadStmt, *ast.EmptyStmt, *ast.BranchStmt:
-		// Skip
 	}
+	return nillOf[N](), false
 }
 
-func (l *lockAnalyzer) analyzeDecl(pass *analysis.Pass, decl ast.Decl) {
+func parentAs[N ast.Node](l *lockAnalyzer) (N, bool) {
+	ln := len(l.stack)
+	if ln <= 1 {
+		return nillOf[N](), false
+	}
+	typedParent, ok := l.stack[ln-2].(N)
+	return typedParent, ok
+}
+
+func (l *lockAnalyzer) analyzeDecl(decl ast.Decl) {
+	l.enter(decl)
+	defer l.leave()
+
 	switch decl := decl.(type) {
 	case *ast.FuncDecl:
-		// TODO we need to have the receiver as context.
-		l.analyzeStmt(pass, decl.Body)
+		l.deferredUnlocks = append(l.deferredUnlocks, make(map[*types.Var]bool))
+
+		l.analyzeStmt(decl.Body)
+
+		ln := len(l.deferredUnlocks)
+		unlocked := l.deferredUnlocks[ln-1]
+		l.deferredUnlocks[ln-1] = nil
+		l.deferredUnlocks = l.deferredUnlocks[0 : ln-1]
+		for lockVar := range unlocked {
+			delete(l.locks, lockVar)
+		}
 	case *ast.GenDecl:
 		if decl.Tok == token.VAR {
 			for _, spec := range decl.Specs {
 				if valueSpec, isValueSpec := spec.(*ast.ValueSpec); isValueSpec {
-					l.analyzeExprs(pass, valueSpec.Values)
+					l.analyzeExprs(valueSpec.Values)
 				}
 			}
 		}
@@ -165,98 +141,189 @@ func (l *lockAnalyzer) analyzeDecl(pass *analysis.Pass, decl ast.Decl) {
 	}
 }
 
-func (l *lockAnalyzer) analyzeExprs(pass *analysis.Pass, exprs []ast.Expr) {
-	for _, expr := range exprs {
-		l.analyzeExpr(pass, expr, nil)
+// TODO handle global vars when we allow protection specs by comments.
+func (l *lockAnalyzer) analyzeStmt(stmt ast.Stmt) {
+	l.enter(stmt)
+	defer l.leave()
+
+	switch stmt := stmt.(type) {
+	case *ast.DeclStmt:
+		l.analyzeDecl(stmt.Decl)
+	case *ast.LabeledStmt:
+		l.analyzeStmt(stmt.Stmt)
+	case *ast.ExprStmt:
+		l.analyzeExpr(stmt.X)
+	case *ast.SendStmt:
+		l.analyzeExpr(stmt.Chan)
+		l.analyzeExpr(stmt.Value)
+	case *ast.IncDecStmt:
+		l.analyzeExpr(stmt.X)
+	case *ast.AssignStmt:
+		l.analyzeExprs(stmt.Lhs)
+		l.analyzeExprs(stmt.Rhs)
+	case *ast.GoStmt:
+		l.analyzeExpr(stmt.Call)
+	case *ast.DeferStmt:
+		l.analyzeExpr(stmt.Call)
+	case *ast.ReturnStmt:
+		l.analyzeExprs(stmt.Results)
+	case *ast.BlockStmt:
+		for _, stmt := range stmt.List {
+			l.analyzeStmt(stmt)
+		}
+	case *ast.IfStmt:
+		l.analyzeStmt(stmt.Init)
+		l.analyzeExpr(stmt.Cond)
+		l.analyzeStmt(stmt.Body)
+		l.analyzeStmt(stmt.Else)
+	case *ast.CaseClause:
+		l.analyzeExprs(stmt.List)
+		for _, innerStmt := range stmt.Body {
+			l.analyzeStmt(innerStmt)
+		}
+	case *ast.SwitchStmt:
+		l.analyzeStmt(stmt.Init)
+		l.analyzeExpr(stmt.Tag)
+		l.analyzeStmt(stmt.Body)
+	case *ast.TypeSwitchStmt:
+		l.analyzeStmt(stmt.Init)
+		l.analyzeStmt(stmt.Assign)
+		l.analyzeStmt(stmt.Body)
+	case *ast.CommClause:
+		l.analyzeStmt(stmt.Comm)
+		for _, innerStmt := range stmt.Body {
+			l.analyzeStmt(innerStmt)
+		}
+	case *ast.SelectStmt:
+		l.analyzeStmt(stmt.Body)
+	case *ast.ForStmt:
+		l.analyzeStmt(stmt.Init)
+		l.analyzeExpr(stmt.Cond)
+		l.analyzeStmt(stmt.Post)
+		l.analyzeStmt(stmt.Body)
+	case *ast.RangeStmt:
+		l.analyzeExpr(stmt.X)
+		l.analyzeStmt(stmt.Body)
+	case *ast.BadStmt, *ast.EmptyStmt, *ast.BranchStmt:
+		// Skip
 	}
 }
 
-func (l *lockAnalyzer) analyzeExpr(pass *analysis.Pass, expr ast.Expr, parent ast.Expr) {
+func (l *lockAnalyzer) analyzeExprs(exprs []ast.Expr) {
+	for _, expr := range exprs {
+		l.analyzeExpr(expr)
+	}
+}
+
+func (l *lockAnalyzer) enter(nd ast.Node) {
+	l.stack = append(l.stack, nd)
+}
+
+func (l *lockAnalyzer) leave() {
+	ln := len(l.stack)
+	if ln > 0 {
+		l.stack[ln-1] = nil
+		l.stack = l.stack[0 : ln-1]
+	}
+}
+
+func (l *lockAnalyzer) isLockHeld(lockVar *types.Var, expr ast.Expr) bool {
+	for _, lockSelector := range l.locks[lockVar] {
+		if expressionsMatch(l.pass, lockSelector.X, expr) {
+			return true
+		}
+	}
+	return false
+}
+
+func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
+	l.enter(expr)
+	defer l.leave()
+
 	switch expr := expr.(type) {
 	case *ast.Ident:
-		if varObj, ok := pass.TypesInfo.ObjectOf(expr).(*types.Var); ok {
-			if lockVar, ok := l.protections[varObj]; ok {
-				if parentAsSelector, ok := parent.(*ast.SelectorExpr); ok {
-					for _, lockHoldingExpr := range l.heldLocks[lockVar] {
-						if expressionsMatch(pass, parentAsSelector.X, lockHoldingExpr) {
-							fmt.Println("Lock", lockVar, "is held while accessing", varObj)
-						} else {
-							fmt.Println("Lock", lockVar, "is not held while accessing", varObj)
+		switch obj := l.pass.TypesInfo.ObjectOf(expr).(type) {
+		case *types.Var:
+			if lockVar, ok := l.protections[obj]; ok {
+				if parent, ok := parentAs[*ast.SelectorExpr](l); ok {
+					if l.isLockHeld(lockVar, parent.X) {
+						fmt.Println("Lock", lockVar, "is held while accessing", obj)
+					} else {
+						fmt.Println("Lock", lockVar, "is not held while accessing", obj)
+					}
+				}
+			}
+		case *types.Func:
+			// TODO handle function checks when we allow protecting them via comments.
+
+			// Check if this is a lock or unlock. We'll need to inspect the variable on which this function is called.
+			if obj.Name() == "Lock" || obj.Name() == "Unlock" {
+				if parent, ok := parentAs[*ast.SelectorExpr](l); ok {
+					if typ := l.pass.TypesInfo.TypeOf(parent.X); typ != nil && (types.Implements(typ, lockerType) || types.Implements(types.NewPointer(typ), lockerType)) {
+						if lockSelector, ok := parent.X.(*ast.SelectorExpr); ok {
+							if lockVar, ok := l.pass.TypesInfo.ObjectOf(lockSelector.Sel).(*types.Var); ok {
+								if obj.Name() == "Lock" {
+									fmt.Println("Locking", lockVar)
+									l.locks[lockVar] = append(l.locks[lockVar], lockSelector)
+								} else {
+									fmt.Println("Unlocking", lockVar)
+									edited := make([]*ast.SelectorExpr, 0)
+									for _, heldLockSelector := range l.locks[lockVar] {
+										if !expressionsMatch(l.pass, heldLockSelector.X, lockSelector.X) {
+											edited = append(edited, heldLockSelector)
+										}
+									}
+									l.locks[lockVar] = edited
+								}
+							}
 						}
 					}
 				}
 			}
 		}
 	case *ast.Ellipsis:
-		l.analyzeExpr(pass, expr.Elt, expr)
+		l.analyzeExpr(expr.Elt)
 	case *ast.FuncLit:
-		l.analyzeStmt(pass, expr.Body)
+		l.analyzeStmt(expr.Body)
 	case *ast.CompositeLit:
 		for _, el := range expr.Elts {
-			l.analyzeExpr(pass, el, expr)
+			l.analyzeExpr(el)
 		}
 	case *ast.ParenExpr:
-		l.analyzeExpr(pass, expr.X, expr)
+		l.analyzeExpr(expr.X)
 	case *ast.SelectorExpr:
-		l.analyzeExpr(pass, expr.X, expr)
-		l.analyzeExpr(pass, expr.Sel, expr)
+		l.analyzeExpr(expr.X)
+		l.analyzeExpr(expr.Sel)
 	case *ast.IndexExpr:
-		l.analyzeExpr(pass, expr.X, expr)
-		l.analyzeExpr(pass, expr.Index, expr)
+		l.analyzeExpr(expr.X)
+		l.analyzeExpr(expr.Index)
 	case *ast.IndexListExpr:
-		l.analyzeExpr(pass, expr.X, expr)
+		l.analyzeExpr(expr.X)
 		for _, ind := range expr.Indices {
-			l.analyzeExpr(pass, ind, expr)
+			l.analyzeExpr(ind)
 		}
 	case *ast.SliceExpr:
-		l.analyzeExpr(pass, expr.X, expr)
-		l.analyzeExpr(pass, expr.Low, expr)
-		l.analyzeExpr(pass, expr.High, expr)
-		l.analyzeExpr(pass, expr.Max, expr)
+		l.analyzeExpr(expr.X)
+		l.analyzeExpr(expr.Low)
+		l.analyzeExpr(expr.High)
+		l.analyzeExpr(expr.Max)
 	case *ast.TypeAssertExpr:
-		l.analyzeExpr(pass, expr.X, expr)
+		l.analyzeExpr(expr.X)
 	case *ast.CallExpr:
-		l.analyzeExpr(pass, expr.Fun, expr)
-
-		// TODO handle function checks when we allow protecting them via comments.
-
-		// Check if this call is a Lock() call.
-		if funcSelector, isSelector := expr.Fun.(*ast.SelectorExpr); isSelector {
-			if exprType := pass.TypesInfo.TypeOf(funcSelector.X); exprType != nil && exprType.String() == "sync.Mutex" {
-				if lockSelector, ok := funcSelector.X.(*ast.SelectorExpr); ok {
-					if lockVar := pass.TypesInfo.ObjectOf(lockSelector.Sel).(*types.Var); lockVar != nil {
-						if funcSelector.Sel.Name == "Lock" {
-							fmt.Println("Locking", lockVar)
-							l.heldLocks[lockVar] = append(l.heldLocks[lockVar], lockSelector.X)
-						} else if funcSelector.Sel.Name == "Unlock" {
-							var updatedExprs []ast.Expr
-							for _, holdingExpr := range l.heldLocks[lockVar] {
-								if !expressionsMatch(pass, lockSelector.X, holdingExpr) {
-									updatedExprs = append(updatedExprs, holdingExpr)
-								} else {
-									fmt.Println("Unlocking", lockVar)
-								}
-							}
-							l.heldLocks[lockVar] = updatedExprs
-						}
-					}
-				}
-			}
-		}
-
+		l.analyzeExpr(expr.Fun)
 		for _, arg := range expr.Args {
-			l.analyzeExpr(pass, arg, expr)
+			l.analyzeExpr(arg)
 		}
 	case *ast.StarExpr:
-		l.analyzeExpr(pass, expr.X, expr)
+		l.analyzeExpr(expr.X)
 	case *ast.UnaryExpr:
-		l.analyzeExpr(pass, expr.X, expr)
+		l.analyzeExpr(expr.X)
 	case *ast.BinaryExpr:
-		l.analyzeExpr(pass, expr.X, expr)
-		l.analyzeExpr(pass, expr.Y, expr)
+		l.analyzeExpr(expr.X)
+		l.analyzeExpr(expr.Y)
 	case *ast.KeyValueExpr:
 		// We're not interested in the key.
-		l.analyzeExpr(pass, expr.Value, expr)
+		l.analyzeExpr(expr.Value)
 	case *ast.BasicLit, *ast.BadExpr:
 		// Skip
 	}
@@ -268,8 +335,6 @@ func expressionsMatch(pass *analysis.Pass, left ast.Expr, right ast.Expr) bool {
 	} else if left == nil || right == nil {
 		return false
 	}
-
-	fmt.Println(reflect.TypeOf(left), reflect.TypeOf(right))
 
 	switch left := left.(type) {
 	case *ast.BadExpr:
@@ -398,12 +463,14 @@ func (f *protectionsFinder) find(pass *analysis.Pass, ins *inspector.Inspector) 
 
 				for _, name := range field.Names {
 					if vr, ok := pass.TypesInfo.ObjectOf(name).(*types.Var); vr != nil && ok {
+						fmt.Println(vr, "is protected by", lockVar)
+
 						f.protections[vr] = lockVar
 
 						// Export protection info as a fact to other packages.
-						//if name.IsExported() {
-						//pass.ExportObjectFact(vr, &protectedBy{lock: lockVar})
-						//}
+						if name.IsExported() {
+							pass.ExportObjectFact(vr, &protectedBy{lock: lockVar})
+						}
 					}
 				}
 			}
@@ -412,6 +479,7 @@ func (f *protectionsFinder) find(pass *analysis.Pass, ins *inspector.Inspector) 
 }
 
 // TODO make this work for function expressions, global lock variables (global context) & embedded fields.
+// TODO what happens when we add generics to the picture?
 func findLockVar(context *types.Struct, expr ast.Expr) *types.Var {
 	switch expr := expr.(type) {
 	case *ast.SelectorExpr:
