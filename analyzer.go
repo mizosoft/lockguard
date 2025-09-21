@@ -80,11 +80,11 @@ func run(pass *analysis.Pass) (interface{}, error) {
 }
 
 type lockAnalyzer struct {
-	protections     map[types.Object]*types.Var
-	locks           map[*types.Var][]*ast.SelectorExpr
-	deferredUnlocks []map[*types.Var]bool
-	pass            *analysis.Pass
-	stack           []ast.Node
+	protections map[types.Object]*types.Var
+	locks       map[*types.Var][]*ast.SelectorExpr
+	deferScopes []map[*types.Var][]*ast.SelectorExpr
+	pass        *analysis.Pass
+	stack       []ast.Node
 }
 
 func nillOf[T any]() T {
@@ -102,13 +102,59 @@ func closest[N ast.Node](l *lockAnalyzer) (N, bool) {
 	return nillOf[N](), false
 }
 
-func parentAs[N ast.Node](l *lockAnalyzer) (N, bool) {
+func ancestorAs[N ast.Node](l *lockAnalyzer, upDepth int) (N, bool) {
 	ln := len(l.stack)
-	if ln <= 1 {
+	if ln-upDepth-1 < 0 {
 		return nillOf[N](), false
 	}
-	typedParent, ok := l.stack[ln-2].(N)
+	typedParent, ok := l.stack[ln-upDepth-1].(N)
 	return typedParent, ok
+}
+
+func (l *lockAnalyzer) enterDeferScope() {
+	l.deferScopes = append(l.deferScopes, make(map[*types.Var][]*ast.SelectorExpr))
+}
+
+func (l *lockAnalyzer) exitDeferScope() {
+	ln := len(l.deferScopes)
+	scope := l.deferScopes[ln-1]
+	l.deferScopes[ln-1] = nil
+	l.deferScopes = l.deferScopes[0 : ln-1]
+	for lockVar, selectors := range scope {
+		l.unlock(lockVar, selectors)
+	}
+}
+
+// TODO a wild idea: consider pointer assignment paths to check if we're referring to the same lock without
+//      necessarily locking/unlocking it with the same expr.
+
+func (l *lockAnalyzer) lock(lockVar *types.Var, lockSelector *ast.SelectorExpr) {
+	fmt.Println("Locking", lockVar)
+	l.locks[lockVar] = append(l.locks[lockVar], lockSelector)
+}
+
+func (l *lockAnalyzer) unlock(lockVar *types.Var, lockSelectors []*ast.SelectorExpr) {
+	fmt.Println("Unlocking", lockVar)
+	edited := make([]*ast.SelectorExpr, 0)
+	for _, heldLockSelector := range l.locks[lockVar] {
+		for _, lockSelector := range lockSelectors {
+			if !expressionsMatch(l.pass, heldLockSelector.X, lockSelector.X) {
+				edited = append(edited, heldLockSelector)
+			}
+		}
+	}
+
+	if len(edited) > 0 {
+		l.locks[lockVar] = edited
+	} else {
+		delete(l.locks, lockVar)
+	}
+}
+
+func (l *lockAnalyzer) deferredUnlock(lockVar *types.Var, lockSelector *ast.SelectorExpr) {
+	fmt.Println("Deferred unlock")
+	ln := len(l.deferScopes)
+	l.deferScopes[ln-1][lockVar] = append(l.deferScopes[ln-1][lockVar], lockSelector)
 }
 
 func (l *lockAnalyzer) analyzeDecl(decl ast.Decl) {
@@ -117,17 +163,9 @@ func (l *lockAnalyzer) analyzeDecl(decl ast.Decl) {
 
 	switch decl := decl.(type) {
 	case *ast.FuncDecl:
-		l.deferredUnlocks = append(l.deferredUnlocks, make(map[*types.Var]bool))
-
+		l.enterDeferScope()
 		l.analyzeStmt(decl.Body)
-
-		ln := len(l.deferredUnlocks)
-		unlocked := l.deferredUnlocks[ln-1]
-		l.deferredUnlocks[ln-1] = nil
-		l.deferredUnlocks = l.deferredUnlocks[0 : ln-1]
-		for lockVar := range unlocked {
-			delete(l.locks, lockVar)
-		}
+		l.exitDeferScope()
 	case *ast.GenDecl:
 		if decl.Tok == token.VAR {
 			for _, spec := range decl.Specs {
@@ -236,6 +274,22 @@ func (l *lockAnalyzer) isLockHeld(lockVar *types.Var, expr ast.Expr) bool {
 	return false
 }
 
+// Check if we're within the execution path of a defer statement. The way we find if we're called within a
+// defer call is generalized as follows: keep moving upwards the tree, and if we find a defer
+// statement before we find an object that invalidates the defer scope (ast.FuncDecl or ast.FuncLit),
+// then we are within a deferred call.
+func (l *lockAnalyzer) isWithinDeferScope() bool {
+	for i := len(l.stack) - 2; i >= 0; i-- {
+		switch l.stack[i].(type) {
+		case *ast.DeferStmt:
+			return true
+		case *ast.FuncLit, *ast.FuncDecl:
+			return false
+		}
+	}
+	return false
+}
+
 func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 	l.enter(expr)
 	defer l.leave()
@@ -245,7 +299,7 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 		switch obj := l.pass.TypesInfo.ObjectOf(expr).(type) {
 		case *types.Var:
 			if lockVar, ok := l.protections[obj]; ok {
-				if parent, ok := parentAs[*ast.SelectorExpr](l); ok {
+				if parent, ok := ancestorAs[*ast.SelectorExpr](l, 1); ok {
 					if l.isLockHeld(lockVar, parent.X) {
 						fmt.Println("Lock", lockVar, "is held while accessing", obj)
 					} else {
@@ -255,25 +309,24 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 			}
 		case *types.Func:
 			// TODO handle function checks when we allow protecting them via comments.
+			// TODO handle TryLock
 
 			// Check if this is a lock or unlock. We'll need to inspect the variable on which this function is called.
 			if obj.Name() == "Lock" || obj.Name() == "Unlock" {
-				if parent, ok := parentAs[*ast.SelectorExpr](l); ok {
-					if typ := l.pass.TypesInfo.TypeOf(parent.X); typ != nil && (types.Implements(typ, lockerType) || types.Implements(types.NewPointer(typ), lockerType)) {
-						if lockSelector, ok := parent.X.(*ast.SelectorExpr); ok {
-							if lockVar, ok := l.pass.TypesInfo.ObjectOf(lockSelector.Sel).(*types.Var); ok {
-								if obj.Name() == "Lock" {
-									fmt.Println("Locking", lockVar)
-									l.locks[lockVar] = append(l.locks[lockVar], lockSelector)
-								} else {
-									fmt.Println("Unlocking", lockVar)
-									edited := make([]*ast.SelectorExpr, 0)
-									for _, heldLockSelector := range l.locks[lockVar] {
-										if !expressionsMatch(l.pass, heldLockSelector.X, lockSelector.X) {
-											edited = append(edited, heldLockSelector)
+				if parent, ok := ancestorAs[*ast.SelectorExpr](l, 1); ok {
+					if _, ok := ancestorAs[*ast.CallExpr](l, 2); ok { // Make sure this is a call expr.
+						if typ := l.pass.TypesInfo.TypeOf(parent.X); typ != nil && (types.Implements(typ, lockerType) || types.Implements(types.NewPointer(typ), lockerType)) {
+							if lockSelector, ok := parent.X.(*ast.SelectorExpr); ok {
+								if lockVar, ok := l.pass.TypesInfo.ObjectOf(lockSelector.Sel).(*types.Var); ok {
+									if obj.Name() == "Lock" {
+										l.lock(lockVar, lockSelector)
+									} else if obj.Name() == "Unlock" {
+										if l.isWithinDeferScope() {
+											l.deferredUnlock(lockVar, lockSelector)
+										} else {
+											l.unlock(lockVar, []*ast.SelectorExpr{lockSelector})
 										}
 									}
-									l.locks[lockVar] = edited
 								}
 							}
 						}
@@ -284,7 +337,9 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 	case *ast.Ellipsis:
 		l.analyzeExpr(expr.Elt)
 	case *ast.FuncLit:
+		l.enterDeferScope()
 		l.analyzeStmt(expr.Body)
+		l.exitDeferScope()
 	case *ast.CompositeLit:
 		for _, el := range expr.Elts {
 			l.analyzeExpr(el)

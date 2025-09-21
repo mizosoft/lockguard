@@ -10,8 +10,24 @@ type S1 struct {
 // Func This is a function
 func Func() {
 	s1 := S1{}
-
 	s1.i++
+
+	//func() {
+	//	s1.mut.Lock()
+	//	defer func() {
+	//		f := func() func() {
+	//			return s1.mut.Unlock
+	//		}
+	//		f()
+	//	}()
+	//}()
+
+	func() {
+		s1.mut.Lock()
+		defer s1.mut.Unlock()
+
+		s1.i++
+	}()
 
 	s1.mut.Lock()
 	s1.i++
