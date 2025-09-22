@@ -1,4 +1,4 @@
-package main
+package lockgaurd
 
 import "golang.org/x/tools/go/analysis/singlechecker"
 

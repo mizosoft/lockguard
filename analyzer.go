@@ -1,4 +1,4 @@
-package main
+package lockgaurd
 
 import (
 	"fmt"
@@ -11,6 +11,9 @@ import (
 	"golang.org/x/tools/go/analysis/passes/inspect"
 	"golang.org/x/tools/go/ast/inspector"
 )
+
+// TODO handle struct literals.
+// TODO we should handle facts exported from other packages.
 
 // Analyzer Checks lock-protected accesses.
 var Analyzer = &analysis.Analyzer{
@@ -320,10 +323,8 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 		case *types.Var:
 			if lockVar, ok := l.protections[obj]; ok {
 				if parent, ok := ancestorAs[*ast.SelectorExpr](l, 1); ok {
-					if l.isLockHeld(lockVar, parent.X) {
-						fmt.Println("Lock", lockVar, "is held while accessing", obj)
-					} else {
-						fmt.Println("Lock", lockVar, "is not held while accessing", obj)
+					if !l.isLockHeld(lockVar, parent.X) {
+						l.pass.Reportf(expr.Pos(), "%s is not held while accessing %s", lockVar.Name(), obj.Name())
 					}
 				}
 			}
@@ -366,6 +367,7 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 		//     is known to execute things inline.
 		// TODO If we feel adventurous, we can also track function literal assignments (e.g. fn = func() { ... }) and only
 		//     warn about the lock analysis results if the variable goes out of scope (passed somewhere or returned).
+		// TODO this will fail inside go statements because the function will be executed on another thread.
 		_, retainLockScope := ancestorAs[*ast.CallExpr](l, 1)
 		if !retainLockScope {
 			l.enterLockScope()
