@@ -4,11 +4,8 @@ import (
 	"fmt"
 	"go/ast"
 	"go/importer"
-	"go/parser"
 	"go/token"
 	"go/types"
-	"reflect"
-	"strings"
 
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/inspect"
@@ -36,16 +33,12 @@ func (p *protectedBy) String() string {
 
 var lockerType *types.Interface
 
-func run(pass *analysis.Pass) (interface{}, error) {
-	if pass.Pkg.Name() != "a" {
-		return nil, nil
-	}
-
+func init() {
 	// Load sync package to get the Locker interface
 	imp := importer.Default()
 	syncPkg, err := imp.Import("sync")
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
 
 	obj := syncPkg.Scope().Lookup("Locker")
@@ -56,6 +49,12 @@ func run(pass *analysis.Pass) (interface{}, error) {
 			}
 		}
 	}
+}
+
+func run(pass *analysis.Pass) (interface{}, error) {
+	if pass.Pkg.Name() != "a" {
+		return nil, nil
+	}
 
 	if lockerType == nil {
 		return nil, fmt.Errorf("unable to find sync.Locker interface type")
@@ -63,12 +62,18 @@ func run(pass *analysis.Pass) (interface{}, error) {
 
 	ins := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
+	//ins.Preorder([]ast.Node{(*ast.FuncDecl)(nil)}, func(node ast.Node) {
+	//	funcDecl := node.(*ast.FuncDecl)
+	//	for _, comment := range funcDecl.Doc.List {
+	//
+	//	}
+	//})
+
 	f := &protectionsFinder{protections: make(map[types.Object]*types.Var)}
 	f.find(pass, ins)
 
 	l := &lockAnalyzer{
 		protections: f.protections,
-		locks:       make(map[*types.Var][]*ast.SelectorExpr),
 		pass:        pass,
 		stack:       make([]ast.Node, 0),
 	}
@@ -77,14 +82,6 @@ func run(pass *analysis.Pass) (interface{}, error) {
 	})
 
 	return nil, nil
-}
-
-type lockAnalyzer struct {
-	protections map[types.Object]*types.Var
-	locks       map[*types.Var][]*ast.SelectorExpr
-	deferScopes []map[*types.Var][]*ast.SelectorExpr
-	pass        *analysis.Pass
-	stack       []ast.Node
 }
 
 func nillOf[T any]() T {
@@ -111,6 +108,24 @@ func ancestorAs[N ast.Node](l *lockAnalyzer, upDepth int) (N, bool) {
 	return typedParent, ok
 }
 
+type lockAnalyzer struct {
+	protections map[types.Object]*types.Var
+	lockScopes  []map[*types.Var][]*ast.SelectorExpr
+	deferScopes []map[*types.Var][]*ast.SelectorExpr
+	pass        *analysis.Pass
+	stack       []ast.Node
+}
+
+func (l *lockAnalyzer) enterLockScope() {
+	l.lockScopes = append(l.deferScopes, make(map[*types.Var][]*ast.SelectorExpr))
+}
+
+func (l *lockAnalyzer) exitLockScope() {
+	ln := len(l.lockScopes)
+	l.lockScopes[ln-1] = nil
+	l.lockScopes = l.lockScopes[0 : ln-1]
+}
+
 func (l *lockAnalyzer) enterDeferScope() {
 	l.deferScopes = append(l.deferScopes, make(map[*types.Var][]*ast.SelectorExpr))
 }
@@ -130,13 +145,15 @@ func (l *lockAnalyzer) exitDeferScope() {
 
 func (l *lockAnalyzer) lock(lockVar *types.Var, lockSelector *ast.SelectorExpr) {
 	fmt.Println("Locking", lockVar)
-	l.locks[lockVar] = append(l.locks[lockVar], lockSelector)
+	ln := len(l.lockScopes)
+	l.lockScopes[ln-1][lockVar] = append(l.lockScopes[ln-1][lockVar], lockSelector)
 }
 
 func (l *lockAnalyzer) unlock(lockVar *types.Var, lockSelectors []*ast.SelectorExpr) {
 	fmt.Println("Unlocking", lockVar)
 	edited := make([]*ast.SelectorExpr, 0)
-	for _, heldLockSelector := range l.locks[lockVar] {
+	ln := len(l.lockScopes)
+	for _, heldLockSelector := range l.lockScopes[ln-1][lockVar] {
 		for _, lockSelector := range lockSelectors {
 			if !expressionsMatch(l.pass, heldLockSelector.X, lockSelector.X) {
 				edited = append(edited, heldLockSelector)
@@ -145,27 +162,29 @@ func (l *lockAnalyzer) unlock(lockVar *types.Var, lockSelectors []*ast.SelectorE
 	}
 
 	if len(edited) > 0 {
-		l.locks[lockVar] = edited
+		l.lockScopes[ln-1][lockVar] = edited
 	} else {
-		delete(l.locks, lockVar)
+		delete(l.lockScopes[ln-1], lockVar)
 	}
 }
 
 func (l *lockAnalyzer) deferredUnlock(lockVar *types.Var, lockSelector *ast.SelectorExpr) {
-	fmt.Println("Deferred unlock")
+	fmt.Println("Deferred unlock of", lockVar)
 	ln := len(l.deferScopes)
 	l.deferScopes[ln-1][lockVar] = append(l.deferScopes[ln-1][lockVar], lockSelector)
 }
 
 func (l *lockAnalyzer) analyzeDecl(decl ast.Decl) {
-	l.enter(decl)
-	defer l.leave()
+	l.enterExpr(decl)
+	defer l.leaveExpr()
 
 	switch decl := decl.(type) {
 	case *ast.FuncDecl:
+		l.enterLockScope()
 		l.enterDeferScope()
 		l.analyzeStmt(decl.Body)
 		l.exitDeferScope()
+		l.exitLockScope()
 	case *ast.GenDecl:
 		if decl.Tok == token.VAR {
 			for _, spec := range decl.Specs {
@@ -181,8 +200,8 @@ func (l *lockAnalyzer) analyzeDecl(decl ast.Decl) {
 
 // TODO handle global vars when we allow protection specs by comments.
 func (l *lockAnalyzer) analyzeStmt(stmt ast.Stmt) {
-	l.enter(stmt)
-	defer l.leave()
+	l.enterExpr(stmt)
+	defer l.leaveExpr()
 
 	switch stmt := stmt.(type) {
 	case *ast.DeclStmt:
@@ -253,11 +272,11 @@ func (l *lockAnalyzer) analyzeExprs(exprs []ast.Expr) {
 	}
 }
 
-func (l *lockAnalyzer) enter(nd ast.Node) {
+func (l *lockAnalyzer) enterExpr(nd ast.Node) {
 	l.stack = append(l.stack, nd)
 }
 
-func (l *lockAnalyzer) leave() {
+func (l *lockAnalyzer) leaveExpr() {
 	ln := len(l.stack)
 	if ln > 0 {
 		l.stack[ln-1] = nil
@@ -266,7 +285,8 @@ func (l *lockAnalyzer) leave() {
 }
 
 func (l *lockAnalyzer) isLockHeld(lockVar *types.Var, expr ast.Expr) bool {
-	for _, lockSelector := range l.locks[lockVar] {
+	ln := len(l.lockScopes)
+	for _, lockSelector := range l.lockScopes[ln-1][lockVar] {
 		if expressionsMatch(l.pass, lockSelector.X, expr) {
 			return true
 		}
@@ -291,8 +311,8 @@ func (l *lockAnalyzer) isWithinDeferScope() bool {
 }
 
 func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
-	l.enter(expr)
-	defer l.leave()
+	l.enterExpr(expr)
+	defer l.leaveExpr()
 
 	switch expr := expr.(type) {
 	case *ast.Ident:
@@ -337,8 +357,26 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 	case *ast.Ellipsis:
 		l.analyzeExpr(expr.Elt)
 	case *ast.FuncLit:
+
+		// Function literals generally require a new lock scope as we don't know where the function will be executed
+		// (e.g. a callback passed to another thread). However, we retain the current lock scope if this literal is
+		// part of a call expression. In that case, know that the function will be executed inline. This heuristic allows
+		// expressions like func() { ... }() to not lose lock holding status.
+		// TODO we can add other heuristics that check if the function is passed as a lambda to another std function that
+		//     is known to execute things inline.
+		// TODO If we feel adventurous, we can also track function literal assignments (e.g. fn = func() { ... }) and only
+		//     warn about the lock analysis results if the variable goes out of scope (passed somewhere or returned).
+		_, retainLockScope := ancestorAs[*ast.CallExpr](l, 1)
+		if !retainLockScope {
+			l.enterLockScope()
+		}
 		l.enterDeferScope()
+
 		l.analyzeStmt(expr.Body)
+
+		if !retainLockScope {
+			l.exitLockScope()
+		}
 		l.exitDeferScope()
 	case *ast.CompositeLit:
 		for _, el := range expr.Elts {
@@ -477,100 +515,4 @@ func expressionListMatches(pass *analysis.Pass, lefts []ast.Expr, rights []ast.E
 		}
 	}
 	return true
-}
-
-type protectionsFinder struct {
-	protections map[types.Object]*types.Var
-}
-
-func (f *protectionsFinder) find(pass *analysis.Pass, ins *inspector.Inspector) {
-	ins.Preorder([]ast.Node{(*ast.StructType)(nil)}, func(n ast.Node) {
-		structType := n.(*ast.StructType)
-
-		strct, ok := pass.TypesInfo.TypeOf(structType).(*types.Struct)
-		if !ok {
-			return
-		}
-
-		for _, field := range structType.Fields.List {
-			if field.Tag != nil {
-				protectedByValue, ok := reflect.StructTag(strings.Trim(field.Tag.Value, "`")).Lookup("protected_by")
-				if !ok {
-					continue
-				}
-
-				lockExpr, err := parser.ParseExpr(protectedByValue)
-				if err != nil {
-					pass.Reportf(field.Tag.ValuePos, "couldn't parse protected_by expression: %v", err)
-					continue
-				}
-
-				lockVar := findLockVar(strct, lockExpr)
-				if lockVar == nil {
-					pass.Reportf(field.Tag.ValuePos, "expression doesn't locate a lock field")
-					continue
-				}
-
-				if !types.Implements(lockVar.Type(), lockerType) && !types.Implements(types.NewPointer(lockVar.Type()), lockerType) {
-					pass.Reportf(field.Tag.ValuePos, "value referred to by expression doesn't implement sync.Locker")
-					continue
-				}
-
-				for _, name := range field.Names {
-					if vr, ok := pass.TypesInfo.ObjectOf(name).(*types.Var); vr != nil && ok {
-						fmt.Println(vr, "is protected by", lockVar)
-
-						f.protections[vr] = lockVar
-
-						// Export protection info as a fact to other packages.
-						if name.IsExported() {
-							pass.ExportObjectFact(vr, &protectedBy{lock: lockVar})
-						}
-					}
-				}
-			}
-		}
-	})
-}
-
-// TODO make this work for function expressions, global lock variables (global context) & embedded fields.
-// TODO what happens when we add generics to the picture?
-func findLockVar(context *types.Struct, expr ast.Expr) *types.Var {
-	switch expr := expr.(type) {
-	case *ast.SelectorExpr:
-		return findField(findLockVarContext(context, expr.X), expr.Sel.Name)
-	case *ast.Ident:
-		return findField(context, expr.Name)
-	}
-	return nil
-}
-
-func findLockVarContext(rootContext *types.Struct, expr ast.Expr) *types.Struct {
-	switch expr := expr.(type) {
-	case *ast.SelectorExpr:
-		if parentContext := findLockVarContext(rootContext, expr.X); parentContext != nil {
-			return findFieldStructType(parentContext, expr.Sel.Name)
-		}
-	case *ast.Ident:
-		return findFieldStructType(rootContext, expr.Name)
-	}
-	return nil
-}
-
-func findFieldStructType(context *types.Struct, name string) *types.Struct {
-	if field := findField(context, name); field != nil {
-		if strct, ok := field.Type().Underlying().(*types.Struct); ok {
-			return strct
-		}
-	}
-	return nil
-}
-
-func findField(context *types.Struct, name string) *types.Var {
-	for field := range context.Fields() {
-		if field.Name() == name {
-			return field
-		}
-	}
-	return nil
 }
