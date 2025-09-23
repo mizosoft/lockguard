@@ -24,16 +24,6 @@ var Analyzer = &analysis.Analyzer{
 	FactTypes: []analysis.Fact{new(protectedBy)},
 }
 
-type protectedBy struct {
-	lock *types.Var
-}
-
-func (p *protectedBy) AFact() {}
-
-func (p *protectedBy) String() string {
-	return fmt.Sprintf("protected_by:\"%s\"", p.lock.Name())
-}
-
 var lockerType *types.Interface
 
 func init() {
@@ -72,7 +62,7 @@ func run(pass *analysis.Pass) (interface{}, error) {
 	//	}
 	//})
 
-	f := &protectionsFinder{protections: make(map[types.Object]*types.Var)}
+	f := &protectionsFinder{protections: make(map[types.Object]protection)}
 	f.find(pass, ins)
 
 	l := &lockAnalyzer{
@@ -107,12 +97,13 @@ func ancestorAs[N ast.Node](l *lockAnalyzer, upDepth int) (N, bool) {
 	if ln-upDepth-1 < 0 {
 		return nillOf[N](), false
 	}
+	// TODO unparen?
 	typedParent, ok := l.stack[ln-upDepth-1].(N)
 	return typedParent, ok
 }
 
 type lockAnalyzer struct {
-	protections map[types.Object]*types.Var
+	protections map[types.Object]protection
 	lockScopes  []map[*types.Var][]*ast.SelectorExpr
 	deferScopes []map[*types.Var][]*ast.SelectorExpr
 	pass        *analysis.Pass
@@ -287,11 +278,17 @@ func (l *lockAnalyzer) leaveExpr() {
 	}
 }
 
-func (l *lockAnalyzer) isLockHeld(lockVar *types.Var, expr ast.Expr) bool {
+func (l *lockAnalyzer) isLockHeld(prot protection, expr ast.Expr) bool {
 	ln := len(l.lockScopes)
-	for _, lockSelector := range l.lockScopes[ln-1][lockVar] {
-		if expressionsMatch(l.pass, lockSelector.X, expr) {
+	_, isIdent := prot.lockExpr.(*ast.Ident)
+	for _, lockSelector := range l.lockScopes[ln-1][prot.lockVar] {
+		// Fast-path: prot.lockExpr is an identifier.
+		if isIdent && expressionsMatch(l.pass, lockSelector.X, expr) {
 			return true
+		} else if trimmedSelector, ok := trimSuffix(lockSelector, prot.lockExpr); ok {
+			if expressionsMatch(l.pass, trimmedSelector, expr) {
+				return true
+			}
 		}
 	}
 	return false
@@ -321,10 +318,10 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 	case *ast.Ident:
 		switch obj := l.pass.TypesInfo.ObjectOf(expr).(type) {
 		case *types.Var:
-			if lockVar, ok := l.protections[obj]; ok {
+			if prot, ok := l.protections[obj]; ok {
 				if parent, ok := ancestorAs[*ast.SelectorExpr](l, 1); ok {
-					if !l.isLockHeld(lockVar, parent.X) {
-						l.pass.Reportf(expr.Pos(), "%s is not held while accessing %s", lockVar.Name(), obj.Name())
+					if !l.isLockHeld(prot, parent.X) {
+						l.pass.Reportf(expr.Pos(), "%s is not held while accessing %s", prot.String(), obj.Name())
 					}
 				}
 			}
@@ -456,10 +453,14 @@ func expressionsMatch(pass *analysis.Pass, left ast.Expr, right ast.Expr) bool {
 		}
 	case *ast.Ident:
 		if right, ok := right.(*ast.Ident); ok {
-			if leftObj := pass.TypesInfo.ObjectOf(left); leftObj != nil {
-				if rightObj := pass.TypesInfo.ObjectOf(right); rightObj != nil {
-					return leftObj == rightObj
+			if pass != nil {
+				if leftObj := pass.TypesInfo.ObjectOf(left); leftObj != nil {
+					if rightObj := pass.TypesInfo.ObjectOf(right); rightObj == leftObj {
+						return true
+					}
 				}
+			} else if left.Name == right.Name { // Compare nominally and not canonically.
+				return true
 			}
 		}
 		return false
@@ -517,4 +518,26 @@ func expressionListMatches(pass *analysis.Pass, lefts []ast.Expr, rights []ast.E
 		}
 	}
 	return true
+}
+
+// TODO this only takes into account the identifier names and not their canonical objects. We can canonicalize the expression w.r.t the strut type scope.
+func trimSuffix(expr, suffix ast.Expr) (ast.Expr, bool) {
+	switch expr := expr.(type) {
+	case *ast.SelectorExpr:
+		switch suffix := suffix.(type) {
+		case *ast.SelectorExpr:
+			if expr.Sel.Name == suffix.Sel.Name {
+				return trimSuffix(expr.X, suffix.X)
+			}
+		case *ast.Ident:
+			if expr.Sel.Name == suffix.Name {
+				return expr.X, true
+			}
+		}
+	case *ast.Ident:
+		if suffix, ok := suffix.(*ast.Ident); ok && expr.Name == suffix.Name {
+			return nil, true
+		}
+	}
+	return nil, false
 }

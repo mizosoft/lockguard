@@ -12,8 +12,27 @@ import (
 	"golang.org/x/tools/go/ast/inspector"
 )
 
+type protection struct {
+	lockVar  *types.Var
+	lockExpr ast.Expr
+}
+
+func (p *protection) String() string {
+	return p.lockVar.Name()
+}
+
+type protectedBy struct {
+	prot protection
+}
+
+func (p *protectedBy) AFact() {}
+
+func (p *protectedBy) String() string {
+	return fmt.Sprintf("protected_by:\"%s\"", p.prot.lockVar.Name())
+}
+
 type protectionsFinder struct {
-	protections map[types.Object]*types.Var
+	protections map[types.Object]protection
 }
 
 func (f *protectionsFinder) find(pass *analysis.Pass, ins *inspector.Inspector) {
@@ -53,11 +72,16 @@ func (f *protectionsFinder) find(pass *analysis.Pass, ins *inspector.Inspector) 
 					if vr, ok := pass.TypesInfo.ObjectOf(name).(*types.Var); vr != nil && ok {
 						fmt.Println(vr, "is protected by", lockVar)
 
-						f.protections[vr] = lockVar
+						prot := protection{
+							lockVar:  lockVar,
+							lockExpr: lockExpr,
+						}
+
+						f.protections[vr] = prot
 
 						// Export protection info as a fact to other packages.
 						if name.IsExported() {
-							pass.ExportObjectFact(vr, &protectedBy{lock: lockVar})
+							pass.ExportObjectFact(vr, &protectedBy{prot: prot})
 						}
 					}
 				}
