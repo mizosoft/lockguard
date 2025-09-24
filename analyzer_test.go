@@ -45,3 +45,7 @@ func TestTrimExpr(t *testing.T) {
 	assert.Assert(t, !ok)
 	assert.Assert(t, trim4 == nil)
 }
+
+func TestCommentParsing(t *testing.T) {
+	// parseCommentTag("")
+}

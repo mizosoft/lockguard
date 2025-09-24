@@ -216,3 +216,44 @@ func (s *S2) methodLockUnlockWithScopes() {
 		s.k++    // want `mut is not held while accessing k`
 	}
 }
+
+//lockguard:protected_by s.mut
+func (s *S1) f() {}
+
+func funcLockUnlock() {
+	var s1 S1
+	s1.f() // want `mut is not held while accessing f`
+
+	s1.mut.Lock()
+	s1.f()
+	s1.mut.Unlock()
+
+	s1.f() // want `mut is not held while accessing f`
+}
+
+func (s *S1) methodFuncLockUnlock() {
+	s.f() // want `mut is not held while accessing f`
+
+	s.mut.Lock()
+	s.f()
+	s.mut.Unlock()
+
+	s.f() // want `mut is not held while accessing f`
+}
+
+func funcLockDeferredUnlock() {
+	var s1 S1
+	s1.f() // want `mut is not held while accessing f`
+
+	s1.mut.Lock()
+	defer s1.mut.Unlock()
+	s1.f()
+}
+
+func (s *S1) methodFuncLockUnlockDeferred() {
+	s.f() // want `mut is not held while accessing f`
+
+	s.mut.Lock()
+	defer s.mut.Unlock()
+	s.f()
+}

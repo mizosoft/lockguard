@@ -278,7 +278,7 @@ func (l *lockAnalyzer) leaveExpr() {
 	}
 }
 
-func (l *lockAnalyzer) isLockHeld(prot protection, expr ast.Expr) bool {
+func (l *lockAnalyzer) isLockHeldBy(expr ast.Expr, prot protection) bool {
 	ln := len(l.lockScopes)
 	_, isIdent := prot.lockExpr.(*ast.Ident)
 	for _, lockSelector := range l.lockScopes[ln-1][prot.lockVar] {
@@ -320,19 +320,26 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 		case *types.Var:
 			if prot, ok := l.protections[obj]; ok {
 				if parent, ok := ancestorAs[*ast.SelectorExpr](l, 1); ok {
-					if !l.isLockHeld(prot, parent.X) {
+					if !l.isLockHeldBy(parent.X, prot) {
 						l.pass.Reportf(expr.Pos(), "%s is not held while accessing %s", prot.String(), obj.Name())
 					}
 				}
 			}
 		case *types.Func:
-			// TODO handle function checks when we allow protecting them via comments.
 			// TODO handle TryLock
+			// TODO consider the case when a protected function is used as a variable (passed/returned)?
+			// TODO when analyzing a protected function, assume that the lock protecting it is held.
 
-			// Check if this is a lock or unlock. We'll need to inspect the variable on which this function is called.
-			if obj.Name() == "Lock" || obj.Name() == "Unlock" {
-				if parent, ok := ancestorAs[*ast.SelectorExpr](l, 1); ok {
-					if _, ok := ancestorAs[*ast.CallExpr](l, 2); ok { // Make sure this is a call expr.
+			if parent, ok := ancestorAs[*ast.SelectorExpr](l, 1); ok {
+				if _, ok := ancestorAs[*ast.CallExpr](l, 2); ok { // Make sure this is a call expr.
+					if prot, ok := l.protections[obj]; ok {
+						if !l.isLockHeldBy(parent.X, prot) {
+							l.pass.Reportf(expr.Pos(), "%s is not held while accessing %s", prot.String(), obj.Name())
+						}
+					}
+
+					// Check if this is a lock or unlock. We'll need to inspect the variable on which this function is called.
+					if obj.Name() == "Lock" || obj.Name() == "Unlock" {
 						if typ := l.pass.TypesInfo.TypeOf(parent.X); typ != nil && (types.Implements(typ, lockerType) || types.Implements(types.NewPointer(typ), lockerType)) {
 							if lockSelector, ok := parent.X.(*ast.SelectorExpr); ok {
 								if lockVar, ok := l.pass.TypesInfo.ObjectOf(lockSelector.Sel).(*types.Var); ok {
