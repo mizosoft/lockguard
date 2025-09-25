@@ -46,6 +46,21 @@ func TestTrimExpr(t *testing.T) {
 	assert.Assert(t, trim4 == nil)
 }
 
-func TestCommentParsing(t *testing.T) {
-	// parseCommentTag("")
+func TestDirectiveParsing(t *testing.T) {
+	value, ok := parseDirective("//lockguard:protected_by s.mu")
+	assert.Assert(t, ok)
+	assert.Equal(t, value, "s.mu")
+
+	value, ok = parseDirective("//lockguard:protected_by mu")
+	assert.Assert(t, ok)
+	assert.Equal(t, value, "mu")
+
+	_, ok = parseDirective("//lockguard:protected_by")
+	assert.Assert(t, !ok)
+
+	_, ok = parseDirective("// lockguard:protected_by s.mu")
+	assert.Assert(t, !ok)
+
+	_, ok = parseDirective("/*lockguard:protected_by s.mu*/")
+	assert.Assert(t, !ok)
 }

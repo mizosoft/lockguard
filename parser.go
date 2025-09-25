@@ -23,6 +23,9 @@ func parseDirective(text string) (string, bool) {
 		return "", false
 	}
 	p.skipWhiteSpace()
+	if p.done() {
+		return "", false
+	}
 	return p.s[p.pos:], true
 }
 
