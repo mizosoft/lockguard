@@ -25,7 +25,7 @@ func TestTrimExpr(t *testing.T) {
 
 	trim1, ok := trimSuffix(expr, suffix1)
 	assert.Assert(t, ok)
-	assert.Assert(t, expressionsMatch(nil, trim1, prefix1))
+	assert.Assert(t, expressionsMatch(trim1, prefix1))
 
 	suffix2, err := parser.ParseExpr("k")
 	assert.NilError(t, err)
@@ -35,7 +35,7 @@ func TestTrimExpr(t *testing.T) {
 
 	trim2, ok := trimSuffix(expr, suffix2)
 	assert.Assert(t, ok)
-	assert.Assert(t, expressionsMatch(nil, trim2, prefix2))
+	assert.Assert(t, expressionsMatch(trim2, prefix2))
 
 	trim3, ok := trimSuffix(expr, expr)
 	assert.Assert(t, ok)

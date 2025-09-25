@@ -153,22 +153,26 @@ func findProtection(context *types.Struct, value string) (protection, error) {
 // TODO what happens when we add generics to the picture?
 func findLockVar(context *types.Struct, expr ast.Expr) *types.Var {
 	switch expr := expr.(type) {
-	case *ast.SelectorExpr:
-		return findField(findLockVarContext(context, expr.X), expr.Sel.Name)
 	case *ast.Ident:
 		return findField(context, expr.Name)
+	case *ast.SelectorExpr:
+		return findField(findLockVarContext(context, expr.X), expr.Sel.Name)
+	case *ast.ParenExpr:
+		return findLockVar(context, expr.X)
 	}
 	return nil
 }
 
 func findLockVarContext(rootContext *types.Struct, expr ast.Expr) *types.Struct {
 	switch expr := expr.(type) {
+	case *ast.Ident:
+		return findFieldStructType(rootContext, expr.Name)
 	case *ast.SelectorExpr:
 		if parentContext := findLockVarContext(rootContext, expr.X); parentContext != nil {
 			return findFieldStructType(parentContext, expr.Sel.Name)
 		}
-	case *ast.Ident:
-		return findFieldStructType(rootContext, expr.Name)
+	case *ast.ParenExpr:
+		return findLockVarContext(rootContext, expr.X)
 	}
 	return nil
 }
@@ -186,22 +190,6 @@ func findField(context *types.Struct, name string) *types.Var {
 	for field := range context.Fields() {
 		if field.Name() == name {
 			return field
-		}
-	}
-	return nil
-}
-
-func findLockVarThroughVar(context *types.Var, expr ast.Expr) *types.Var {
-	switch expr := expr.(type) {
-	case *ast.SelectorExpr:
-		if parentVar := findLockVarThroughVar(context, expr.X); parentVar != nil {
-			if strct, ok := removePointer(parentVar.Type()).Underlying().(*types.Struct); ok {
-				return findField(strct, expr.Sel.Name)
-			}
-		}
-	case *ast.Ident:
-		if context.Name() == expr.Name {
-			return context
 		}
 	}
 	return nil
