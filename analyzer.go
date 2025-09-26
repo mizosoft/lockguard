@@ -91,8 +91,11 @@ func ancestorAs[N ast.Node](l *lockAnalyzer, upDepth int) (N, bool) {
 	if ln-upDepth-1 < 0 {
 		return nillOf[N](), false
 	}
-	// TODO unparen?
-	typedParent, ok := l.stack[ln-upDepth-1].(N)
+	parent := l.stack[ln-upDepth-1]
+	if exprParent, ok := parent.(ast.Expr); ok {
+		parent = ast.Unparen(exprParent)
+	}
+	typedParent, ok := parent.(N)
 	return typedParent, ok
 }
 
@@ -278,7 +281,28 @@ func (l *lockAnalyzer) analyzeDecl(decl ast.Decl) {
 	case *ast.FuncDecl:
 		l.enterLockScope()
 		l.enterDeferScope()
+
+		// If this function is protected by a lock, we'll assume this lock is held while analyzing it. This allows other
+		// functions/variables protected by the same lock to be called within this function.
+		var explicitLock struct {
+			prot protection
+			recv *types.Var
+		}
+		if fnc, ok := l.pass.TypesInfo.ObjectOf(decl.Name).(*types.Func); ok {
+			if prot, ok := l.protections[fnc]; ok {
+				if recv := fnc.Signature().Recv(); recv != nil {
+					explicitLock.prot, explicitLock.recv = prot, recv
+					l.lock(prot.lockVar, recv, prot.lockExprWithReceiver)
+				}
+			}
+		}
+
 		l.analyzeStmt(decl.Body)
+
+		if explicitLock.recv != nil {
+			l.unlock(explicitLock.prot.lockVar, explicitLock.recv, explicitLock.prot.lockExprWithReceiver)
+		}
+
 		l.exitDeferScope()
 		l.exitLockScope()
 	case *ast.GenDecl:
@@ -534,6 +558,15 @@ func expressionsMatch(left ast.Expr, right ast.Expr) bool {
 		return false
 	}
 
+	// Although this is not right from an evaluation perspective, it suffices for current usage, where expressions are
+	// expected to be lock/field selectors. Parenthesis won't matter in such case.
+	if _, ok := left.(*ast.ParenExpr); ok {
+		return expressionsMatch(ast.Unparen(left), right)
+	}
+	if _, ok := right.(*ast.ParenExpr); ok {
+		return expressionsMatch(left, ast.Unparen(right))
+	}
+
 	switch left := left.(type) {
 	case *ast.BadExpr:
 		return false
@@ -573,10 +606,6 @@ func expressionsMatch(left ast.Expr, right ast.Expr) bool {
 	case *ast.KeyValueExpr:
 		if right, ok := right.(*ast.KeyValueExpr); ok {
 			return expressionsMatch(left.Key, right.Key) && expressionsMatch(left.Value, right.Value)
-		}
-	case *ast.ParenExpr:
-		if right, ok := right.(*ast.ParenExpr); ok {
-			return expressionsMatch(left.X, right.X)
 		}
 	case *ast.SelectorExpr:
 		if right, ok := right.(*ast.SelectorExpr); ok {
@@ -636,6 +665,8 @@ func trimSuffix(expr, suffix ast.Expr) (ast.Expr, bool) {
 		if suffix, ok := suffix.(*ast.Ident); ok && expr.Name == suffix.Name {
 			return nil, true
 		}
+	case *ast.ParenExpr:
+		return trimSuffix(expr.X, suffix)
 	}
 	return nil, false
 }
@@ -646,6 +677,8 @@ func findLockIdent(lockSelector ast.Expr) *ast.Ident {
 		return lockSelector.Sel
 	case *ast.Ident:
 		return lockSelector
+	case *ast.ParenExpr:
+		return findLockIdent(lockSelector.X)
 	default:
 		return nil
 	}

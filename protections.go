@@ -14,8 +14,9 @@ import (
 )
 
 type protection struct {
-	lockVar  *types.Var
-	lockExpr ast.Expr
+	lockVar              *types.Var
+	lockExpr             ast.Expr
+	lockExprWithReceiver ast.Expr // The original lock expression in guarded functions.
 }
 
 func (p *protection) String() string {
@@ -116,6 +117,14 @@ func (f *protectionsFinder) findFuncProtection(pass *analysis.Pass, funcType *as
 					pass.Reportf(comment.Pos(), "%v", err)
 					return
 				}
+
+				lockExprWithReceiver, err := parser.ParseExpr(protectedByValue)
+				if err != nil {
+					pass.Reportf(comment.Pos(), "%v", err)
+					return
+				}
+
+				prot.lockExprWithReceiver = lockExprWithReceiver
 
 				f.protections[fnc] = prot
 

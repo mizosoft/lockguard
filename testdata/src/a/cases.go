@@ -218,42 +218,66 @@ func (s *S2) methodLockUnlockWithScopes() {
 }
 
 //lockguard:protected_by s.mut
-func (s *S1) f() {}
+func (s *S1) f1() {}
 
 func funcLockUnlock() {
 	var s1 S1
-	s1.f() // want `mut is not held while accessing f`
+	s1.f1() // want `mut is not held while accessing f`
 
 	s1.mut.Lock()
-	s1.f()
+	s1.f1()
 	s1.mut.Unlock()
 
-	s1.f() // want `mut is not held while accessing f`
+	s1.f1() // want `mut is not held while accessing f`
 }
 
 func (s *S1) methodFuncLockUnlock() {
-	s.f() // want `mut is not held while accessing f`
+	s.f1() // want `mut is not held while accessing f`
 
 	s.mut.Lock()
-	s.f()
+	s.f1()
 	s.mut.Unlock()
 
-	s.f() // want `mut is not held while accessing f`
+	s.f1() // want `mut is not held while accessing f`
 }
 
 func funcLockDeferredUnlock() {
 	var s1 S1
-	s1.f() // want `mut is not held while accessing f`
+	s1.f1() // want `mut is not held while accessing f`
 
 	s1.mut.Lock()
 	defer s1.mut.Unlock()
-	s1.f()
+	s1.f1()
 }
 
 func (s *S1) methodFuncLockUnlockDeferred() {
-	s.f() // want `mut is not held while accessing f`
+	s.f1() // want `mut is not held while accessing f`
 
 	s.mut.Lock()
 	defer s.mut.Unlock()
-	s.f()
+	s.f1()
+}
+
+//lockguard:protected_by s.mut
+func (s *S1) f2() {
+	// We can call fields protected by s.mut
+	s.i++
+	s.f1()
+}
+
+//lockguard:protected_by s.s1.mut
+func (s *S2) f() {}
+
+//lockguard:protected_by s.s1.mut
+func (s *S2) f2() {
+	s.s1.i++
+	s.s1.f1()
+	s.k++
+}
+
+func (s *S1) parenthesizedExpr() {
+	((s).mut).Lock()
+	defer ((s).mut).Unlock()
+
+	((s).i)++
 }
