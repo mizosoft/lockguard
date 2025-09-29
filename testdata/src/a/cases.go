@@ -11,6 +11,33 @@ type S1 struct {
 	mut sync.Mutex
 }
 
+func (s *S1) mutFunc() *sync.Mutex {
+	return &s.mut
+}
+
+type S2 struct {
+	s1 S1
+	k  int `protected_by:"s1.mut"`
+}
+
+func (s *S2) s1Func() *S1 {
+	return &s.s1
+}
+
+type S3 struct {
+	s2 S2
+	j  int `protected_by:"s2.s1Func().mutFunc()"`
+}
+
+func (s *S3) s2Func() *S2 {
+	return &s.s2
+}
+
+type S4 struct {
+	s3 S3
+	r  int `protected_by:"s3.s2Func().s1Func().mut"`
+}
+
 func lockUnlock() {
 	var s1 S1
 	s1.i++ // want `mut is not held while accessing i`
@@ -100,11 +127,6 @@ func (s *S1) funcLiteralInCallMaintainsScope() {
 		s.i++ // Inline functions retain current lock scope
 	}()
 	s.mut.Unlock()
-}
-
-type S2 struct {
-	s1 S1
-	k  int `protected_by:"s1.mut"`
 }
 
 func nestedLockUnlock() {
@@ -280,4 +302,22 @@ func (s *S1) parenthesizedExpr() {
 	defer ((s).mut).Unlock()
 
 	((s).i)++
+}
+
+func (s *S3) lockDeferredUnlockWithFuncExpr() {
+	s.j++ // want `mutFunc is not held while accessing j`
+
+	s.s2.s1Func().mutFunc().Lock()
+	defer s.s2.s1Func().mutFunc().Unlock()
+
+	s.j++
+}
+
+func (s *S4) lockDeferredUnlockWithFuncExpr2() {
+	s.r++ // want `mut is not held while accessing r`
+
+	s.s3.s2Func().s1Func().mut.Lock()
+	defer s.s3.s2Func().s1Func().mut.Unlock()
+
+	s.r++
 }

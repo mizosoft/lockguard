@@ -3,7 +3,6 @@ package lockgaurd
 import (
 	"fmt"
 	"go/ast"
-	"go/importer"
 	"go/token"
 	"go/types"
 
@@ -25,26 +24,6 @@ var Analyzer = &analysis.Analyzer{
 	FactTypes: []analysis.Fact{new(protectedBy)},
 }
 
-var lockerType *types.Interface
-
-func init() {
-	// Load sync package to get the Locker interface
-	imp := importer.Default()
-	syncPkg, err := imp.Import("sync")
-	if err != nil {
-		panic(err)
-	}
-
-	obj := syncPkg.Scope().Lookup("Locker")
-	if typeName, ok := obj.(*types.TypeName); ok {
-		if named, ok := typeName.Type().(*types.Named); ok {
-			if iface, ok := named.Underlying().(*types.Interface); ok {
-				lockerType = iface
-			}
-		}
-	}
-}
-
 func run(pass *analysis.Pass) (interface{}, error) {
 	if pass.Pkg.Name() != "a" {
 		return nil, nil
@@ -56,8 +35,11 @@ func run(pass *analysis.Pass) (interface{}, error) {
 
 	ins := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
-	f := &protectionsFinder{protections: make(map[types.Object]protection)}
-	f.find(pass, ins)
+	f := &protectionsFinder{
+		protections: make(map[types.Object]protection),
+		pass:        pass,
+	}
+	f.find(ins)
 
 	l := &lockAnalyzer{
 		protections: f.protections,
@@ -138,39 +120,39 @@ func findRootObj(expr ast.Expr, pass *analysis.Pass) (types.Object, bool) {
 }
 
 type lockScope struct {
-	locks map[*types.Var]map[types.Object][]ast.Expr // lockVar -> root selector (nil if global) -> list of expressions selecting the lock.
+	locks map[types.Object]map[types.Object][]ast.Expr // lockObj -> root selector (nil if global) -> list of expressions selecting the lock.
 }
 
-func (s *lockScope) add(lockVar *types.Var, root types.Object, lockSelector ast.Expr) {
-	locksForVar, ok := s.locks[lockVar]
+func (s *lockScope) add(lockObj types.Object, root types.Object, lockSelector ast.Expr) {
+	locksForVar, ok := s.locks[lockObj]
 	if !ok {
 		locksForVar = make(map[types.Object][]ast.Expr)
-		s.locks[lockVar] = locksForVar
+		s.locks[lockObj] = locksForVar
 	}
 	locksForVar[root] = append(locksForVar[root], lockSelector)
 }
 
-func (s *lockScope) remove(lockVar *types.Var, root types.Object, lockSelector ast.Expr) {
+func (s *lockScope) remove(lockObj types.Object, root types.Object, lockSelector ast.Expr) {
 	edited := make([]ast.Expr, 0)
-	for _, existingSelector := range s.locks[lockVar][root] {
+	for _, existingSelector := range s.locks[lockObj][root] {
 		if !expressionsMatch(existingSelector, lockSelector) {
 			edited = append(edited, existingSelector)
 		}
 	}
 
 	if len(edited) > 0 {
-		s.locks[lockVar][root] = edited
+		s.locks[lockObj][root] = edited
 	} else {
-		delete(s.locks[lockVar], root)
-		if len(s.locks[lockVar]) == 0 {
-			delete(s.locks, lockVar)
+		delete(s.locks[lockObj], root)
+		if len(s.locks[lockObj]) == 0 {
+			delete(s.locks, lockObj)
 		}
 	}
 }
 
-func (s *lockScope) removeAll(lockVar *types.Var, root types.Object, lockSelectors []ast.Expr) {
+func (s *lockScope) removeAll(lockObj types.Object, root types.Object, lockSelectors []ast.Expr) {
 	edited := make([]ast.Expr, 0)
-	for _, existingSelector := range s.locks[lockVar][root] {
+	for _, existingSelector := range s.locks[lockObj][root] {
 		add := true
 		for _, lockSelector := range lockSelectors {
 			if expressionsMatch(existingSelector, lockSelector) {
@@ -185,11 +167,11 @@ func (s *lockScope) removeAll(lockVar *types.Var, root types.Object, lockSelecto
 	}
 
 	if len(edited) > 0 {
-		s.locks[lockVar][root] = edited
+		s.locks[lockObj][root] = edited
 	} else {
-		delete(s.locks[lockVar], root)
-		if len(s.locks[lockVar]) == 0 {
-			delete(s.locks, lockVar)
+		delete(s.locks[lockObj], root)
+		if len(s.locks[lockObj]) == 0 {
+			delete(s.locks, lockObj)
 		}
 	}
 }
@@ -200,7 +182,7 @@ func (s *lockScope) isLockHeldBy(expr ast.Expr, prot protection, pass *analysis.
 		return false
 	}
 
-	for _, lockSelector := range s.locks[prot.lockVar][root] {
+	for _, lockSelector := range s.locks[prot.lockObj][root] {
 		if trimmedLockSelector, ok := trimSuffix(lockSelector, prot.lockExpr); ok && expressionsMatch(trimmedLockSelector, expr) {
 			return true
 		}
@@ -218,7 +200,7 @@ type lockAnalyzer struct {
 
 func (l *lockAnalyzer) enterLockScope() {
 	l.lockScopes = append(l.lockScopes, &lockScope{
-		locks: make(map[*types.Var]map[types.Object][]ast.Expr),
+		locks: make(map[types.Object]map[types.Object][]ast.Expr),
 	})
 }
 
@@ -230,7 +212,7 @@ func (l *lockAnalyzer) exitLockScope() {
 
 func (l *lockAnalyzer) enterDeferScope() {
 	l.deferScopes = append(l.deferScopes, &lockScope{
-		locks: make(map[*types.Var]map[types.Object][]ast.Expr),
+		locks: make(map[types.Object]map[types.Object][]ast.Expr),
 	})
 }
 
@@ -239,9 +221,9 @@ func (l *lockAnalyzer) exitDeferScope() {
 	scope := l.deferScopes[ln-1]
 	l.deferScopes[ln-1] = nil
 	l.deferScopes = l.deferScopes[0 : ln-1]
-	for lockVar, roots := range scope.locks {
+	for lockObj, roots := range scope.locks {
 		for root, exprs := range roots {
-			l.unlockAll(lockVar, root, exprs)
+			l.unlockAll(lockObj, root, exprs)
 		}
 	}
 }
@@ -249,28 +231,28 @@ func (l *lockAnalyzer) exitDeferScope() {
 // TODO a wild idea: consider pointer assignment paths to check if we're referring to the same lock without
 //      necessarily locking/unlocking it with the same expr.
 
-func (l *lockAnalyzer) lock(lockVar *types.Var, root types.Object, lockSelector ast.Expr) {
-	fmt.Println("Locking", lockVar, "for root", root, "with lockSelector", types.ExprString(lockSelector))
-	l.lockScopes[len(l.lockScopes)-1].add(lockVar, root, lockSelector)
+func (l *lockAnalyzer) lock(lockObj types.Object, root types.Object, lockSelector ast.Expr) {
+	fmt.Println("Locking", lockObj, "for root", root, "with lockSelector", types.ExprString(lockSelector))
+	l.lockScopes[len(l.lockScopes)-1].add(lockObj, root, lockSelector)
 }
 
-func (l *lockAnalyzer) unlock(lockVar *types.Var, root types.Object, lockSelector ast.Expr) {
-	fmt.Println("Unlocking", lockVar, "for root", root, "with lockSelector", types.ExprString(lockSelector))
-	l.lockScopes[len(l.lockScopes)-1].remove(lockVar, root, lockSelector)
+func (l *lockAnalyzer) unlock(lockObj types.Object, root types.Object, lockSelector ast.Expr) {
+	fmt.Println("Unlocking", lockObj, "for root", root, "with lockSelector", types.ExprString(lockSelector))
+	l.lockScopes[len(l.lockScopes)-1].remove(lockObj, root, lockSelector)
 }
 
-func (l *lockAnalyzer) unlockAll(lockVar *types.Var, root types.Object, lockSelectors []ast.Expr) {
+func (l *lockAnalyzer) unlockAll(lockObj types.Object, root types.Object, lockSelectors []ast.Expr) {
 	str := ""
 	for _, s := range lockSelectors {
 		str += types.ExprString(s)
 	}
-	fmt.Println("Unlocking", lockVar, "for root", root, "with lockSelectors", str)
-	l.lockScopes[len(l.lockScopes)-1].removeAll(lockVar, root, lockSelectors)
+	fmt.Println("Unlocking", lockObj, "for root", root, "with lockSelectors", str)
+	l.lockScopes[len(l.lockScopes)-1].removeAll(lockObj, root, lockSelectors)
 }
 
-func (l *lockAnalyzer) deferredUnlock(lockVar *types.Var, root types.Object, lockSelector ast.Expr) {
+func (l *lockAnalyzer) deferredUnlock(lockObj types.Object, root types.Object, lockSelector ast.Expr) {
 	ln := len(l.deferScopes)
-	l.deferScopes[ln-1].add(lockVar, root, lockSelector)
+	l.deferScopes[ln-1].add(lockObj, root, lockSelector)
 }
 
 func (l *lockAnalyzer) analyzeDecl(decl ast.Decl) {
@@ -292,7 +274,7 @@ func (l *lockAnalyzer) analyzeDecl(decl ast.Decl) {
 			if prot, ok := l.protections[fnc]; ok {
 				if recv := fnc.Signature().Recv(); recv != nil {
 					explicitLock.prot, explicitLock.recv = prot, recv
-					l.lock(prot.lockVar, recv, prot.lockExprWithReceiver)
+					l.lock(prot.lockObj, recv, prot.lockExprWithReceiver)
 				}
 			}
 		}
@@ -300,7 +282,7 @@ func (l *lockAnalyzer) analyzeDecl(decl ast.Decl) {
 		l.analyzeStmt(decl.Body)
 
 		if explicitLock.recv != nil {
-			l.unlock(explicitLock.prot.lockVar, explicitLock.recv, explicitLock.prot.lockExprWithReceiver)
+			l.unlock(explicitLock.prot.lockObj, explicitLock.recv, explicitLock.prot.lockExprWithReceiver)
 		}
 
 		l.exitDeferScope()
@@ -442,7 +424,6 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 		case *types.Func:
 			// TODO handle TryLock
 			// TODO consider the case when a protected function is used as a variable (passed/returned)?
-			// TODO when analyzing a protected function, assume that the lock protecting it is held.
 
 			if parent, ok := ancestorAs[*ast.SelectorExpr](l, 1); ok {
 				// Make sure this is a call expr, because it may just be a function selector (e.g. s.mut.Lock).
@@ -453,21 +434,24 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 						}
 					}
 
-					// Check if this is a lock or unlock. We'll need to inspect the variable on which this function is called.
+					// Check if this is a lock or unlock. We'll need to inspect the variable or function expression on which this function is called.
 					if obj.Name() == "Lock" || obj.Name() == "Unlock" {
-						if typ := l.pass.TypesInfo.TypeOf(parent.X); typ != nil && (types.Implements(typ, lockerType) || types.Implements(types.NewPointer(typ), lockerType)) {
-							lockSelector := parent.X
-							if lockIdent := findLockIdent(lockSelector); lockIdent != nil {
-								if lockVar, ok := l.pass.TypesInfo.ObjectOf(lockIdent).(*types.Var); ok {
-									if lockSelectorParent, ok := parentOf(lockSelector); ok {
-										if root, ok := findRootObj(lockSelectorParent, l.pass); ok {
-											if obj.Name() == "Lock" {
-												l.lock(lockVar, root, lockSelector)
-											} else if obj.Name() == "Unlock" {
-												if l.isWithinDeferScope() {
-													l.deferredUnlock(lockVar, root, lockSelector)
-												} else {
-													l.unlock(lockVar, root, lockSelector)
+						if typ := l.pass.TypesInfo.TypeOf(parent.X); typ != nil {
+							_, isCall := parent.X.(*ast.CallExpr)
+							if isLocker(typ, !isCall) {
+								lockSelector := parent.X
+								if lockIdent := findLockIdent(lockSelector); lockIdent != nil {
+									if lockObj := l.pass.TypesInfo.ObjectOf(lockIdent); lockObj != nil {
+										if lockSelectorParent, ok := parentOf(lockSelector); ok {
+											if root, ok := findRootObj(lockSelectorParent, l.pass); ok {
+												if obj.Name() == "Lock" {
+													l.lock(lockObj, root, lockSelector)
+												} else if obj.Name() == "Unlock" {
+													if l.isWithinDeferScope() {
+														l.deferredUnlock(lockObj, root, lockSelector)
+													} else {
+														l.unlock(lockObj, root, lockSelector)
+													}
 												}
 											}
 										}
@@ -625,7 +609,7 @@ func expressionsMatch(left ast.Expr, right ast.Expr) bool {
 		}
 	case *ast.FuncLit:
 		// Matching two function literals would complicate things considerably as we'd have to match statement by statement.
-		// And doing so doesn't seem to be needed anyways.
+		// And doing so isn't needed anyways.
 		return false
 	case *ast.TypeAssertExpr, *ast.StructType, *ast.MapType, *ast.InterfaceType, *ast.FuncType, *ast.ChanType, *ast.ArrayType:
 		// We're not interested in types so we'll pass.
@@ -650,6 +634,10 @@ func expressionListMatches(lefts []ast.Expr, rights []ast.Expr) bool {
 // TODO this only takes into account the identifier names and not their canonical objects. We can canonicalize the expression w.r.t the strut type scope.
 func trimSuffix(expr, suffix ast.Expr) (ast.Expr, bool) {
 	switch expr := expr.(type) {
+	case *ast.Ident:
+		if suffix, ok := suffix.(*ast.Ident); ok && expr.Name == suffix.Name {
+			return nil, true
+		}
 	case *ast.SelectorExpr:
 		switch suffix := suffix.(type) {
 		case *ast.SelectorExpr:
@@ -661,9 +649,9 @@ func trimSuffix(expr, suffix ast.Expr) (ast.Expr, bool) {
 				return expr.X, true
 			}
 		}
-	case *ast.Ident:
-		if suffix, ok := suffix.(*ast.Ident); ok && expr.Name == suffix.Name {
-			return nil, true
+	case *ast.CallExpr:
+		if suffix, ok := suffix.(*ast.CallExpr); ok {
+			return trimSuffix(expr.Fun, suffix.Fun)
 		}
 	case *ast.ParenExpr:
 		return trimSuffix(expr.X, suffix)
@@ -673,10 +661,12 @@ func trimSuffix(expr, suffix ast.Expr) (ast.Expr, bool) {
 
 func findLockIdent(lockSelector ast.Expr) *ast.Ident {
 	switch lockSelector := lockSelector.(type) {
-	case *ast.SelectorExpr:
-		return lockSelector.Sel
 	case *ast.Ident:
 		return lockSelector
+	case *ast.SelectorExpr:
+		return lockSelector.Sel
+	case *ast.CallExpr:
+		return findLockIdent(lockSelector.Fun)
 	case *ast.ParenExpr:
 		return findLockIdent(lockSelector.X)
 	default:
