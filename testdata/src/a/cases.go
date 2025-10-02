@@ -15,29 +15,6 @@ func (s *S1) mutFunc() *sync.Mutex {
 	return &s.mut
 }
 
-type S2 struct {
-	s1 S1
-	k  int `protected_by:"s1.mut"`
-}
-
-func (s *S2) s1Func() *S1 {
-	return &s.s1
-}
-
-type S3 struct {
-	s2 S2
-	j  int `protected_by:"s2.s1Func().mutFunc()"`
-}
-
-func (s *S3) s2Func() *S2 {
-	return &s.s2
-}
-
-type S4 struct {
-	s3 S3
-	r  int `protected_by:"s3.s2Func().s1Func().mut"`
-}
-
 func lockUnlock() {
 	var s1 S1
 	s1.i++ // want `mut is not held while accessing i`
@@ -129,6 +106,15 @@ func (s *S1) funcLiteralInCallMaintainsScope() {
 	s.mut.Unlock()
 }
 
+type S2 struct {
+	s1 S1
+	k  int `protected_by:"s1.mut"`
+}
+
+func (s *S2) s1Func() *S1 {
+	return &s.s1
+}
+
 func nestedLockUnlock() {
 	var s2 S2
 	s2.s1.i++ // want `mut is not held while accessing i`
@@ -193,6 +179,31 @@ func lockUnlockWithScopes() {
 						case 1:
 							s2.s1.i++
 							s2.k++
+
+							// This function will retain lock scope as it is called inline.
+							func() {
+								s2.s1.i++
+								s2.k++
+
+								// This function loses lock scope.
+								fn := func() {
+									s2.s1.i++ // want `mut is not held while accessing i`
+									s2.k++    // want `mut is not held while accessing k`
+
+									fn2 := func() {
+										s2.s1.mut.Lock()
+										defer s2.s1.mut.Unlock()
+
+										func() {
+											s2.s1.i++
+											s2.k++
+										}()
+									}
+									fmt.Println(fn2)
+								}
+								fmt.Println(fn)
+
+							}()
 						}
 					}
 					s2.s1.mut.Unlock()
@@ -304,6 +315,15 @@ func (s *S1) parenthesizedExpr() {
 	((s).i)++
 }
 
+type S3 struct {
+	s2 S2
+	j  int `protected_by:"s2.s1Func().mutFunc()"`
+}
+
+func (s *S3) s2Func() *S2 {
+	return &s.s2
+}
+
 func (s *S3) lockDeferredUnlockWithFuncExpr() {
 	s.j++ // want `mutFunc is not held while accessing j`
 
@@ -313,6 +333,11 @@ func (s *S3) lockDeferredUnlockWithFuncExpr() {
 	s.j++
 }
 
+type S4 struct {
+	s3 S3
+	r  int `protected_by:"s3.s2Func().s1Func().mut"`
+}
+
 func (s *S4) lockDeferredUnlockWithFuncExpr2() {
 	s.r++ // want `mut is not held while accessing r`
 
@@ -320,4 +345,59 @@ func (s *S4) lockDeferredUnlockWithFuncExpr2() {
 	defer s.s3.s2Func().s1Func().mut.Unlock()
 
 	s.r++
+}
+
+type S5 struct {
+	auto_rw int `protected_by:"mut"`
+	r       int `read_protected_by:"mut"`
+	w       int `write_protected_by:"mut"`
+	rw      int `rw_protected_by:"mut"`
+	mut     sync.RWMutex
+}
+
+func (s *S5) readWriteLockUnlock() {
+	s.auto_rw++   // want `mut is not held while accessing auto_rw`
+	_ = s.auto_rw // want `mut is not held while accessing auto_rw`
+	s.r++         // want `mut is not held while accessing r`
+	_ = s.r       // want `mut is not held while accessing r`
+	s.w++         // want `mut is not held while accessing w`
+	_ = s.w       // want `mut is not held while accessing w`
+	s.rw++        // want `mut is not held while accessing rw`
+	_ = s.rw      // want `mut is not held while accessing rw`
+
+	s.mut.RLock()
+	_ = s.auto_rw
+	s.mut.RUnlock()
+
+	s.mut.RLock()
+	s.auto_rw++ // want `mut is not held while accessing auto_rw`
+	s.mut.RUnlock()
+
+	s.mut.Lock()
+	s.auto_rw++
+	s.mut.Unlock()
+
+	s.mut.RLock()
+	s.r++
+	s.mut.RUnlock()
+
+	s.mut.Lock()
+	s.r++
+	s.mut.Unlock()
+
+	s.mut.RLock()
+	s.w++ // want `mut is not held while accessing w`
+	s.mut.RUnlock()
+
+	s.mut.Lock()
+	s.w++
+	s.mut.Unlock()
+
+	s.mut.RLock()
+	s.rw++
+	s.mut.RUnlock()
+
+	s.mut.Lock()
+	s.rw++
+	s.mut.Unlock()
 }

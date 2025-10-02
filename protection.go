@@ -1,7 +1,6 @@
 package lockgaurd
 
 import (
-	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -14,29 +13,117 @@ import (
 	"golang.org/x/tools/go/ast/inspector"
 )
 
+type protectionDirective string
+
+const (
+	protectedBy      protectionDirective = "protected_by"
+	readProtectedBy  protectionDirective = "read_protected_by"
+	writeProtectedBy protectionDirective = "write_protected_by"
+	rwProtectedBy    protectionDirective = "rw_protected_by"
+)
+
+var protectionDirectives = []protectionDirective{
+	protectedBy, readProtectedBy, writeProtectedBy, rwProtectedBy,
+}
+
+func (directive protectionDirective) isSupportedBy(kind lockKind) bool {
+	switch directive {
+	case protectedBy:
+		return kind == rwLockKind || kind == normalLockKind
+	case readProtectedBy, writeProtectedBy, rwProtectedBy:
+		return kind == rwLockKind
+	default:
+		panic("unknown protectionDirective: " + directive)
+	}
+}
+
+func (directive protectionDirective) isSatisfiedBy(lock heldLock, access accessKind) bool {
+	switch directive {
+	case protectedBy:
+		switch lock.kind {
+		case normalLockKind:
+			return true
+		case rwLockKind:
+			return access == readAccessKind || !lock.isRead
+		default:
+			return false
+		}
+	case readProtectedBy, rwProtectedBy:
+		return lock.kind == rwLockKind // Either Lock or RLock would work here.
+	case writeProtectedBy:
+		return lock.kind == rwLockKind && !lock.isRead
+	default:
+		panic("unknown protectionDirective: " + directive)
+	}
+}
+
 type protection struct {
+	directive            protectionDirective
 	lockObj              types.Object // The function or variable locating the lock.
 	lockExpr             ast.Expr
-	lockExprWithReceiver ast.Expr // The original lock expression in guarded functions.
+	lockExprWithReceiver ast.Expr // Only non-nil for guarded functions with receivers.
+}
+
+func (p *protection) lockExprString() string {
+	if p.lockExprWithReceiver != nil {
+		return types.ExprString(p.lockExprWithReceiver)
+	} else {
+		return types.ExprString(p.lockExpr)
+	}
 }
 
 func (p *protection) String() string {
-	return p.lockObj.Name()
+	return p.lockExprString()
 }
 
-type protectedBy struct {
+type protectionFact struct {
 	prot protection
 }
 
-func (p *protectedBy) AFact() {}
+func (p *protectionFact) AFact() {}
 
-func (p *protectedBy) String() string {
-	return fmt.Sprintf("protected_by:\"%s\"", p.prot.lockObj.Name())
+func (p *protectionFact) String() string {
+	return p.prot.String()
+}
+
+type protectionsMap struct {
+	mp map[types.Object][]protection
+}
+
+func (p *protectionsMap) get(obj types.Object, directive protectionDirective) []protection {
+	var prots []protection
+	for _, prot := range p.mp[obj] {
+		if prot.directive == directive {
+			prots = append(prots, prot)
+		}
+	}
+	return prots
+}
+
+func (p *protectionsMap) getAll(obj types.Object) []protection {
+	return p.mp[obj]
+}
+
+func (p *protectionsMap) put(obj types.Object, prot protection) {
+	p.mp[obj] = append(p.mp[obj], prot)
+}
+
+func newProtectionsMap() protectionsMap {
+	return protectionsMap{
+		mp: make(map[types.Object][]protection),
+	}
 }
 
 type protectionsFinder struct {
-	protections map[types.Object]protection
+	protections protectionsMap
 	pass        *analysis.Pass
+}
+
+func newFinder(pass *analysis.Pass) protectionsFinder {
+	return protectionsFinder{
+		protections: newProtectionsMap(),
+		pass:        pass,
+	}
 }
 
 func (f *protectionsFinder) find(ins *inspector.Inspector) {
@@ -63,29 +150,33 @@ func (f *protectionsFinder) findStructProtections(structType *ast.StructType, sp
 
 	var def *types.Named
 	if spec != nil {
-		def = findStructDefinition(spec, f.pass)
+		def = f.findStructDefinition(spec)
 	}
 
 	for _, field := range structType.Fields.List {
 		if field.Tag != nil {
-			protectedByValue, ok := reflect.StructTag(strings.Trim(field.Tag.Value, "`")).Lookup("protected_by")
-			if !ok {
-				continue
-			}
+			for _, directive := range protectionDirectives {
+				value, ok := reflect.StructTag(strings.Trim(field.Tag.Value, "`")).Lookup(string(directive))
+				if !ok {
+					continue
+				}
 
-			prot, err := f.findProtection(strct, def, protectedByValue)
-			if err != nil {
-				f.pass.Reportf(field.Tag.ValuePos, "%v", err)
-				return
-			}
+				prot, err := f.findProtection(strct, def, directive, value)
+				if err != nil {
+					f.pass.Reportf(field.Tag.ValuePos, "%v", err)
+					return
+				}
 
-			for _, name := range field.Names {
-				if vr, ok := f.pass.TypesInfo.ObjectOf(name).(*types.Var); vr != nil && ok {
-					f.protections[vr] = prot
+				for _, name := range field.Names {
+					if vr, ok := f.pass.TypesInfo.ObjectOf(name).(*types.Var); vr != nil && ok {
+						f.protections.put(vr, prot)
 
-					// Export protection info as a fact to other packages.
-					if name.IsExported() {
-						f.pass.ExportObjectFact(vr, &protectedBy{prot: prot})
+						// Export protection info as a fact to other packages.
+						if name.IsExported() {
+							f.pass.ExportObjectFact(vr, &protectionFact{
+								prot: prot,
+							})
+						}
 					}
 				}
 			}
@@ -109,33 +200,33 @@ func (f *protectionsFinder) findFuncProtection(funcType *ast.FuncDecl) {
 		return
 	}
 
-	receiverType, ok := removePointer(receiver.Type()).(*types.Named)
+	receiverDef, ok := removePointer(receiver.Type()).(*types.Named)
 	if !ok {
 		return
 	}
 
-	receiverStruct, ok := removePointer(receiverType).Underlying().(*types.Struct)
+	receiverStruct, ok := removePointer(receiverDef).Underlying().(*types.Struct)
 	if !ok {
 		return
 	}
 
 	if funcType.Doc != nil {
 		for _, comment := range funcType.Doc.List {
-			if protectedByValue, ok := parseDirective(comment.Text); ok {
+			if kind, value, ok := parseCommentDirective(comment.Text); ok {
 				// TODO we'll need to change this if we support embedded types (where the receiver is itself the lock)
-				normalizedValue, ok := strings.CutPrefix(protectedByValue, receiver.Name()+".")
+				normalizedValue, ok := strings.CutPrefix(value, receiver.Name()+".")
 				if !ok {
 					f.pass.Reportf(comment.Pos(), "expression doesn't locate a lock field")
 					return
 				}
 
-				prot, err := f.findProtection(receiverStruct, receiverType, normalizedValue)
+				prot, err := f.findProtection(receiverStruct, receiverDef, kind, normalizedValue)
 				if err != nil {
 					f.pass.Reportf(comment.Pos(), "%v", err)
 					return
 				}
 
-				lockExprWithReceiver, err := parser.ParseExpr(protectedByValue)
+				lockExprWithReceiver, err := parser.ParseExpr(value)
 				if err != nil {
 					f.pass.Reportf(comment.Pos(), "%v", err)
 					return
@@ -143,41 +234,44 @@ func (f *protectionsFinder) findFuncProtection(funcType *ast.FuncDecl) {
 
 				prot.lockExprWithReceiver = lockExprWithReceiver
 
-				f.protections[fnc] = prot
+				f.protections.put(fnc, prot)
 
 				// Export protection info as a fact to other packages.
 				if funcType.Name.IsExported() {
-					f.pass.ExportObjectFact(fnc, &protectedBy{prot: prot})
+					f.pass.ExportObjectFact(fnc, &protectionFact{
+						prot: prot,
+					})
 				}
 			}
 		}
 	}
 }
 
-func (f *protectionsFinder) findProtection(context *types.Struct, contextDef *types.Named, value string) (protection, error) {
+func (f *protectionsFinder) findProtection(context *types.Struct, contextDef *types.Named, directive protectionDirective, value string) (protection, error) {
 	lockExpr, err := parser.ParseExpr(value)
 	if err != nil {
 		return protection{}, fmt.Errorf("couldn't parse protected_by expression (%s): %v", value, err)
 	}
 
 	lockObj := f.findExprObj(context, contextDef, lockExpr, false)
-	switch lockObj := lockObj.(type) {
-	case *types.Func:
-		if lockObj.Signature().Results().Len() != 1 || !isLocker(lockObj.Signature().Results().At(0).Type(), false) {
-			return protection{}, errors.New("value referred to by expression doesn't implement sync.Locker")
-		}
-	case *types.Var:
-		if !isLocker(lockObj.Type(), true) {
-			return protection{}, errors.New("value referred to by expression doesn't implement sync.Locker")
-		}
-	default:
-		return protection{}, errors.New("expression doesn't locate a lock field")
+	if !directive.isSupportedBy(lockKindOfObject(lockObj)) {
+		return protection{}, fmt.Errorf("selected object's type doesn't satisfied %s", directive)
 	}
 
 	return protection{
-		lockObj:  lockObj,
-		lockExpr: lockExpr,
+		directive: directive,
+		lockObj:   lockObj,
+		lockExpr:  lockExpr,
 	}, nil
+}
+
+func (f *protectionsFinder) findStructDefinition(spec *ast.TypeSpec) *types.Named {
+	if typeName, ok := f.pass.TypesInfo.ObjectOf(spec.Name).(*types.TypeName); ok {
+		if def, ok := typeName.Type().(*types.Named); ok {
+			return def
+		}
+	}
+	return nil
 }
 
 // TODO make this work global lock variables (global context) & embedded fields.
@@ -303,13 +397,4 @@ func lastOf[T any](seq iter.Seq[T]) (T, bool) {
 		ok = true
 	}
 	return last, ok
-}
-
-func findStructDefinition(spec *ast.TypeSpec, pass *analysis.Pass) *types.Named {
-	if typeName, ok := pass.TypesInfo.ObjectOf(spec.Name).(*types.TypeName); ok {
-		if def, ok := typeName.Type().(*types.Named); ok {
-			return def
-		}
-	}
-	return nil
 }

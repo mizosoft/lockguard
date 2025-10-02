@@ -21,7 +21,7 @@ var Analyzer = &analysis.Analyzer{
 	Doc:       "Checks lock-protected accesses",
 	Run:       run,
 	Requires:  []*analysis.Analyzer{inspect.Analyzer},
-	FactTypes: []analysis.Fact{new(protectedBy)},
+	FactTypes: []analysis.Fact{new(protectionFact)},
 }
 
 func run(pass *analysis.Pass) (interface{}, error) {
@@ -29,22 +29,19 @@ func run(pass *analysis.Pass) (interface{}, error) {
 		return nil, nil
 	}
 
-	if lockerType == nil {
+	if lockerInterface == nil {
 		return nil, fmt.Errorf("unable to find sync.Locker interface type")
 	}
 
 	ins := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
-	f := &protectionsFinder{
-		protections: make(map[types.Object]protection),
-		pass:        pass,
-	}
+	f := newFinder(pass)
 	f.find(ins)
 
 	l := &lockAnalyzer{
 		protections: f.protections,
-		pass:        pass,
 		stack:       make([]ast.Node, 0),
+		pass:        pass,
 	}
 	ins.Preorder([]ast.Node{(*ast.FuncDecl)(nil), (*ast.GenDecl)(nil), (*ast.BadDecl)(nil)}, func(node ast.Node) {
 		l.analyzeDecl(node.(ast.Decl))
@@ -56,16 +53,6 @@ func run(pass *analysis.Pass) (interface{}, error) {
 func nillOf[T any]() T {
 	var t T
 	return t
-}
-
-func closest[N ast.Node](l *lockAnalyzer) (N, bool) {
-	ln := len(l.stack)
-	for i := ln - 2; i >= 0; i-- {
-		if typedNode, ok := l.stack[i].(N); ok {
-			return typedNode, true
-		}
-	}
-	return nillOf[N](), false
 }
 
 func ancestorAs[N ast.Node](l *lockAnalyzer, upDepth int) (N, bool) {
@@ -119,88 +106,119 @@ func findRootObj(expr ast.Expr, pass *analysis.Pass) (types.Object, bool) {
 	return nil, false
 }
 
-type lockScope struct {
-	locks map[types.Object]map[types.Object][]ast.Expr // lockObj -> root selector (nil if global) -> list of expressions selecting the lock.
+type heldLock struct {
+	isRead   bool
+	kind     lockKind
+	selector ast.Expr // The expression selecting the lock.
 }
 
-func (s *lockScope) add(lockObj types.Object, root types.Object, lockSelector ast.Expr) {
+type lockScope struct {
+	locks map[types.Object]map[types.Object][]heldLock // lockObj -> root selector (nil if global) -> list of expressions holding the lock.
+}
+
+func (s *lockScope) add(lockObj types.Object, root types.Object, lock heldLock) {
 	locksForVar, ok := s.locks[lockObj]
 	if !ok {
-		locksForVar = make(map[types.Object][]ast.Expr)
+		locksForVar = make(map[types.Object][]heldLock)
 		s.locks[lockObj] = locksForVar
 	}
-	locksForVar[root] = append(locksForVar[root], lockSelector)
+	locksForVar[root] = append(locksForVar[root], lock)
 }
 
-func (s *lockScope) remove(lockObj types.Object, root types.Object, lockSelector ast.Expr) {
-	edited := make([]ast.Expr, 0)
-	for _, existingSelector := range s.locks[lockObj][root] {
-		if !expressionsMatch(existingSelector, lockSelector) {
-			edited = append(edited, existingSelector)
-		}
-	}
-
-	if len(edited) > 0 {
-		s.locks[lockObj][root] = edited
-	} else {
-		delete(s.locks[lockObj], root)
-		if len(s.locks[lockObj]) == 0 {
-			delete(s.locks, lockObj)
-		}
-	}
-}
-
-func (s *lockScope) removeAll(lockObj types.Object, root types.Object, lockSelectors []ast.Expr) {
-	edited := make([]ast.Expr, 0)
-	for _, existingSelector := range s.locks[lockObj][root] {
-		add := true
-		for _, lockSelector := range lockSelectors {
-			if expressionsMatch(existingSelector, lockSelector) {
-				add = false
-				break
+func (s *lockScope) remove(lockObj types.Object, root types.Object, lock heldLock) {
+	edited := make([]heldLock, 0)
+	if locksForVar, ok := s.locks[lockObj]; ok {
+		for _, existingLock := range locksForVar[root] {
+			if existingLock.isRead != lock.isRead || !expressionsMatch(existingLock.selector, lock.selector) {
+				edited = append(edited, existingLock)
 			}
 		}
 
-		if add {
-			edited = append(edited, existingSelector)
-		}
-	}
-
-	if len(edited) > 0 {
-		s.locks[lockObj][root] = edited
-	} else {
-		delete(s.locks[lockObj], root)
-		if len(s.locks[lockObj]) == 0 {
-			delete(s.locks, lockObj)
+		if len(edited) > 0 {
+			s.locks[lockObj][root] = edited
+		} else {
+			delete(s.locks[lockObj], root)
+			if len(s.locks[lockObj]) == 0 {
+				delete(s.locks, lockObj)
+			}
 		}
 	}
 }
 
-func (s *lockScope) isLockHeldBy(expr ast.Expr, prot protection, pass *analysis.Pass) bool {
-	root, ok := findRootObj(expr, pass)
-	if !ok {
-		return false
-	}
+func (s *lockScope) removeAll(lockObj types.Object, root types.Object, locks []heldLock) {
+	edited := make([]heldLock, 0)
+	if locksForVar, ok := s.locks[lockObj]; ok {
+		for _, existingLock := range locksForVar[root] {
+			add := true
+			for _, lock := range locks {
+				if existingLock.isRead != lock.isRead || !expressionsMatch(existingLock.selector, lock.selector) {
+					add = false
+					break
+				}
+			}
 
-	for _, lockSelector := range s.locks[prot.lockObj][root] {
-		if trimmedLockSelector, ok := trimSuffix(lockSelector, prot.lockExpr); ok && expressionsMatch(trimmedLockSelector, expr) {
-			return true
+			if add {
+				edited = append(edited, existingLock)
+			}
+		}
+
+		if len(edited) > 0 {
+			s.locks[lockObj][root] = edited
+		} else {
+			delete(s.locks[lockObj], root)
+			if len(s.locks[lockObj]) == 0 {
+				delete(s.locks, lockObj)
+			}
+		}
+	}
+}
+
+func (s *lockScope) isProtectedBy(prot protection, expr ast.Expr, access accessKind, root types.Object) bool {
+	if locksForVar, ok := s.locks[prot.lockObj]; ok {
+		for _, lock := range locksForVar[root] {
+			if prot.directive.isSatisfiedBy(lock, access) {
+				if trimmedLockSelector, ok := trimSuffix(lock.selector, prot.lockExpr); ok && expressionsMatch(trimmedLockSelector, expr) {
+					return true
+				}
+			}
 		}
 	}
 	return false
 }
 
+func (s *lockScope) isProtectedByAll(prots []protection, expr ast.Expr, access accessKind, pass *analysis.Pass) bool {
+	root, ok := findRootObj(expr, pass)
+	if !ok {
+		return false
+	}
+
+	for _, prot := range prots {
+		if !s.isProtectedBy(prot, expr, access, root) {
+			return false
+		}
+	}
+	return true
+}
+
+type accessKind int
+
+const (
+	readAccessKind  accessKind = iota
+	writeAccessKind            = iota
+)
+
 type lockAnalyzer struct {
-	protections map[types.Object]protection
+	protections protectionsMap
 	lockScopes  []*lockScope
 	deferScopes []*lockScope
-	pass        *analysis.Pass
 	stack       []ast.Node
+	accessStack []accessKind
+	pass        *analysis.Pass
 }
 
 func (l *lockAnalyzer) enterLockScope() {
 	l.lockScopes = append(l.lockScopes, &lockScope{
-		locks: make(map[types.Object]map[types.Object][]ast.Expr),
+		locks: make(map[types.Object]map[types.Object][]heldLock),
 	})
 }
 
@@ -212,7 +230,7 @@ func (l *lockAnalyzer) exitLockScope() {
 
 func (l *lockAnalyzer) enterDeferScope() {
 	l.deferScopes = append(l.deferScopes, &lockScope{
-		locks: make(map[types.Object]map[types.Object][]ast.Expr),
+		locks: make(map[types.Object]map[types.Object][]heldLock),
 	})
 }
 
@@ -222,42 +240,55 @@ func (l *lockAnalyzer) exitDeferScope() {
 	l.deferScopes[ln-1] = nil
 	l.deferScopes = l.deferScopes[0 : ln-1]
 	for lockObj, roots := range scope.locks {
-		for root, exprs := range roots {
-			l.unlockAll(lockObj, root, exprs)
+		for root, locks := range roots {
+			l.unlockAll(lockObj, root, locks)
 		}
 	}
+}
+
+func (l *lockAnalyzer) enterAccess(access accessKind) {
+	l.accessStack = append(l.accessStack, access)
+}
+
+func (l *lockAnalyzer) leaveAccess() {
+	l.accessStack = l.accessStack[0 : len(l.accessStack)-1]
+}
+
+func (l *lockAnalyzer) currentAccess() accessKind {
+	ln := len(l.accessStack)
+	if ln > 0 {
+		return l.accessStack[ln-1]
+	}
+	return readAccessKind // Default to read access.
 }
 
 // TODO a wild idea: consider pointer assignment paths to check if we're referring to the same lock without
 //      necessarily locking/unlocking it with the same expr.
 
-func (l *lockAnalyzer) lock(lockObj types.Object, root types.Object, lockSelector ast.Expr) {
-	fmt.Println("Locking", lockObj, "for root", root, "with lockSelector", types.ExprString(lockSelector))
-	l.lockScopes[len(l.lockScopes)-1].add(lockObj, root, lockSelector)
+func (l *lockAnalyzer) lock(lockObj types.Object, root types.Object, lock heldLock) {
+	l.lockScopes[len(l.lockScopes)-1].add(lockObj, root, lock)
 }
 
-func (l *lockAnalyzer) unlock(lockObj types.Object, root types.Object, lockSelector ast.Expr) {
-	fmt.Println("Unlocking", lockObj, "for root", root, "with lockSelector", types.ExprString(lockSelector))
-	l.lockScopes[len(l.lockScopes)-1].remove(lockObj, root, lockSelector)
+func (l *lockAnalyzer) unlock(lockObj types.Object, root types.Object, lock heldLock) {
+	l.lockScopes[len(l.lockScopes)-1].remove(lockObj, root, lock)
 }
 
-func (l *lockAnalyzer) unlockAll(lockObj types.Object, root types.Object, lockSelectors []ast.Expr) {
+func (l *lockAnalyzer) unlockAll(lockObj types.Object, root types.Object, locks []heldLock) {
 	str := ""
-	for _, s := range lockSelectors {
-		str += types.ExprString(s)
+	for _, l := range locks {
+		str += types.ExprString(l.selector)
 	}
-	fmt.Println("Unlocking", lockObj, "for root", root, "with lockSelectors", str)
-	l.lockScopes[len(l.lockScopes)-1].removeAll(lockObj, root, lockSelectors)
+	l.lockScopes[len(l.lockScopes)-1].removeAll(lockObj, root, locks)
 }
 
-func (l *lockAnalyzer) deferredUnlock(lockObj types.Object, root types.Object, lockSelector ast.Expr) {
+func (l *lockAnalyzer) deferredUnlock(lockObj types.Object, root types.Object, lock heldLock) {
 	ln := len(l.deferScopes)
-	l.deferScopes[ln-1].add(lockObj, root, lockSelector)
+	l.deferScopes[ln-1].add(lockObj, root, lock)
 }
 
 func (l *lockAnalyzer) analyzeDecl(decl ast.Decl) {
-	l.enterExpr(decl)
-	defer l.leaveExpr()
+	l.enter(decl)
+	defer l.leave()
 
 	switch decl := decl.(type) {
 	case *ast.FuncDecl:
@@ -266,23 +297,34 @@ func (l *lockAnalyzer) analyzeDecl(decl ast.Decl) {
 
 		// If this function is protected by a lock, we'll assume this lock is held while analyzing it. This allows other
 		// functions/variables protected by the same lock to be called within this function.
-		var explicitLock struct {
+		var explicitLocks []struct {
 			prot protection
 			recv *types.Var
 		}
 		if fnc, ok := l.pass.TypesInfo.ObjectOf(decl.Name).(*types.Func); ok {
-			if prot, ok := l.protections[fnc]; ok {
+			for _, prot := range l.protections.getAll(fnc) {
 				if recv := fnc.Signature().Recv(); recv != nil {
-					explicitLock.prot, explicitLock.recv = prot, recv
-					l.lock(prot.lockObj, recv, prot.lockExprWithReceiver)
+					explicitLocks = append(explicitLocks, struct {
+						prot protection
+						recv *types.Var
+					}{prot, recv})
+					l.lock(prot.lockObj, recv, heldLock{
+						kind:     lockKindOfObject(prot.lockObj),
+						selector: prot.lockExprWithReceiver,
+					})
 				}
 			}
 		}
 
 		l.analyzeStmt(decl.Body)
 
-		if explicitLock.recv != nil {
-			l.unlock(explicitLock.prot.lockObj, explicitLock.recv, explicitLock.prot.lockExprWithReceiver)
+		for _, el := range explicitLocks {
+			if el.recv != nil {
+				l.unlock(el.prot.lockObj, el.recv, heldLock{
+					kind:     lockKindOfObject(el.prot.lockObj),
+					selector: el.prot.lockExprWithReceiver,
+				})
+			}
 		}
 
 		l.exitDeferScope()
@@ -302,8 +344,12 @@ func (l *lockAnalyzer) analyzeDecl(decl ast.Decl) {
 
 // TODO handle global vars when we allow protection specs by comments.
 func (l *lockAnalyzer) analyzeStmt(stmt ast.Stmt) {
-	l.enterExpr(stmt)
-	defer l.leaveExpr()
+	if stmt == nil {
+		return
+	}
+
+	l.enter(stmt)
+	defer l.leave()
 
 	switch stmt := stmt.(type) {
 	case *ast.DeclStmt:
@@ -313,36 +359,62 @@ func (l *lockAnalyzer) analyzeStmt(stmt ast.Stmt) {
 	case *ast.ExprStmt:
 		l.analyzeExpr(stmt.X)
 	case *ast.SendStmt:
+		l.enterAccess(writeAccessKind) // Sending to a channel is writing to it.
 		l.analyzeExpr(stmt.Chan)
+		l.leaveAccess()
+
+		l.enterAccess(readAccessKind)
 		l.analyzeExpr(stmt.Value)
+		l.leaveAccess()
 	case *ast.IncDecStmt:
+		l.enterAccess(writeAccessKind)
 		l.analyzeExpr(stmt.X)
+		l.leaveAccess()
 	case *ast.AssignStmt:
+		l.enterAccess(writeAccessKind)
 		l.analyzeExprs(stmt.Lhs)
+		l.leaveAccess()
+
+		l.enterAccess(readAccessKind)
 		l.analyzeExprs(stmt.Rhs)
+		l.leaveAccess()
 	case *ast.GoStmt:
+		// We're reading the function to launch a goroutine with.
+		l.enterAccess(readAccessKind)
 		l.analyzeExpr(stmt.Call)
+		l.leaveAccess()
 	case *ast.DeferStmt:
+		// We're reading the function to defer.
+		l.enterAccess(readAccessKind)
 		l.analyzeExpr(stmt.Call)
+		l.leaveAccess()
 	case *ast.ReturnStmt:
+		l.enterAccess(readAccessKind)
 		l.analyzeExprs(stmt.Results)
+		l.leaveAccess()
 	case *ast.BlockStmt:
 		for _, stmt := range stmt.List {
 			l.analyzeStmt(stmt)
 		}
 	case *ast.IfStmt:
 		l.analyzeStmt(stmt.Init)
+		l.enterAccess(readAccessKind)
 		l.analyzeExpr(stmt.Cond)
+		l.leaveAccess()
 		l.analyzeStmt(stmt.Body)
 		l.analyzeStmt(stmt.Else)
 	case *ast.CaseClause:
+		l.enterAccess(readAccessKind)
 		l.analyzeExprs(stmt.List)
+		l.leaveAccess()
 		for _, innerStmt := range stmt.Body {
 			l.analyzeStmt(innerStmt)
 		}
 	case *ast.SwitchStmt:
 		l.analyzeStmt(stmt.Init)
+		l.enterAccess(readAccessKind)
 		l.analyzeExpr(stmt.Tag)
+		l.leaveAccess()
 		l.analyzeStmt(stmt.Body)
 	case *ast.TypeSwitchStmt:
 		l.analyzeStmt(stmt.Init)
@@ -357,11 +429,19 @@ func (l *lockAnalyzer) analyzeStmt(stmt ast.Stmt) {
 		l.analyzeStmt(stmt.Body)
 	case *ast.ForStmt:
 		l.analyzeStmt(stmt.Init)
+		l.enterAccess(readAccessKind)
 		l.analyzeExpr(stmt.Cond)
+		l.leaveAccess()
 		l.analyzeStmt(stmt.Post)
 		l.analyzeStmt(stmt.Body)
 	case *ast.RangeStmt:
+		l.enterAccess(writeAccessKind)
+		l.analyzeExpr(stmt.Key)
+		l.analyzeExpr(stmt.Value)
+		l.leaveAccess()
+		l.enterAccess(readAccessKind)
 		l.analyzeExpr(stmt.X)
+		l.leaveAccess()
 		l.analyzeStmt(stmt.Body)
 	case *ast.BadStmt, *ast.EmptyStmt, *ast.BranchStmt:
 		// Skip
@@ -374,11 +454,11 @@ func (l *lockAnalyzer) analyzeExprs(exprs []ast.Expr) {
 	}
 }
 
-func (l *lockAnalyzer) enterExpr(nd ast.Node) {
+func (l *lockAnalyzer) enter(nd ast.Node) {
 	l.stack = append(l.stack, nd)
 }
 
-func (l *lockAnalyzer) leaveExpr() {
+func (l *lockAnalyzer) leave() {
 	ln := len(l.stack)
 	if ln > 0 {
 		l.stack[ln-1] = nil
@@ -386,8 +466,8 @@ func (l *lockAnalyzer) leaveExpr() {
 	}
 }
 
-func (l *lockAnalyzer) isLockHeldBy(expr ast.Expr, prot protection) bool {
-	return l.lockScopes[len(l.lockScopes)-1].isLockHeldBy(expr, prot, l.pass)
+func (l *lockAnalyzer) isProtectedBy(prots []protection, expr ast.Expr, access accessKind) bool {
+	return l.lockScopes[len(l.lockScopes)-1].isProtectedByAll(prots, expr, access, l.pass)
 }
 
 // Check if we're within the execution path of a defer statement. The way we find if we're called within a
@@ -407,18 +487,29 @@ func (l *lockAnalyzer) isWithinDeferScope() bool {
 }
 
 func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
-	l.enterExpr(expr)
-	defer l.leaveExpr()
+	if expr == nil {
+		return
+	}
+
+	l.enter(expr)
+	defer l.leave()
 
 	switch expr := expr.(type) {
 	case *ast.Ident:
 		switch obj := l.pass.TypesInfo.ObjectOf(expr).(type) {
 		case *types.Var:
-			if prot, ok := l.protections[obj]; ok {
-				if parent, ok := ancestorAs[*ast.SelectorExpr](l, 1); ok {
-					if !l.isLockHeldBy(parent.X, prot) {
-						l.pass.Reportf(expr.Pos(), "%s is not held while accessing %s", prot.String(), obj.Name())
+			if parent, ok := ancestorAs[*ast.SelectorExpr](l, 1); ok {
+				protStr := ""
+				many := false
+				for _, prot := range l.protections.getAll(obj) {
+					if many {
+						protStr += ", "
 					}
+					protStr += prot.lockObj.Name()
+					many = true
+				}
+				if !l.isProtectedBy(l.protections.getAll(obj), parent.X, l.currentAccess()) {
+					l.pass.Reportf(expr.Pos(), "%s is not held while accessing %s", protStr, obj.Name())
 				}
 			}
 		case *types.Func:
@@ -428,37 +519,22 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 			if parent, ok := ancestorAs[*ast.SelectorExpr](l, 1); ok {
 				// Make sure this is a call expr, because it may just be a function selector (e.g. s.mut.Lock).
 				if _, ok := ancestorAs[*ast.CallExpr](l, 2); ok {
-					if prot, ok := l.protections[obj]; ok {
-						if !l.isLockHeldBy(parent.X, prot) {
-							l.pass.Reportf(expr.Pos(), "%s is not held while accessing %s", prot.String(), obj.Name())
+					if !l.isProtectedBy(l.protections.getAll(obj), parent.X, l.currentAccess()) {
+						protStr := ""
+						many := false
+						for _, prot := range l.protections.getAll(obj) {
+							if many {
+								protStr += ", "
+							}
+							protStr += prot.lockObj.Name()
+							many = true
 						}
+						l.pass.Reportf(expr.Pos(), "%s is not held while accessing %s", protStr, obj.Name())
 					}
 
-					// Check if this is a lock or unlock. We'll need to inspect the variable or function expression on which this function is called.
-					if obj.Name() == "Lock" || obj.Name() == "Unlock" {
-						if typ := l.pass.TypesInfo.TypeOf(parent.X); typ != nil {
-							_, isCall := parent.X.(*ast.CallExpr)
-							if isLocker(typ, !isCall) {
-								lockSelector := parent.X
-								if lockIdent := findLockIdent(lockSelector); lockIdent != nil {
-									if lockObj := l.pass.TypesInfo.ObjectOf(lockIdent); lockObj != nil {
-										if lockSelectorParent, ok := parentOf(lockSelector); ok {
-											if root, ok := findRootObj(lockSelectorParent, l.pass); ok {
-												if obj.Name() == "Lock" {
-													l.lock(lockObj, root, lockSelector)
-												} else if obj.Name() == "Unlock" {
-													if l.isWithinDeferScope() {
-														l.deferredUnlock(lockObj, root, lockSelector)
-													} else {
-														l.unlock(lockObj, root, lockSelector)
-													}
-												}
-											}
-										}
-									}
-								}
-							}
-						}
+					if typ := l.pass.TypesInfo.TypeOf(parent.X); typ != nil {
+						_, isCall := parent.X.(*ast.CallExpr)
+						l.inspectLockCall(parent.X, obj.Name(), lockKindOf(typ, !isCall))
 					}
 				}
 			}
@@ -528,6 +604,39 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 		l.analyzeExpr(expr.Value)
 	case *ast.BasicLit, *ast.BadExpr:
 		// Skip
+	}
+}
+
+// Checks if this is a lock or unlock.
+func (l *lockAnalyzer) inspectLockCall(selector ast.Expr, funcName string, kind lockKind) {
+	// We'll need to inspect the variable or function expression on which this function is called.
+	if lockIdent := findLockIdent(selector); lockIdent != nil {
+		if lockObj := l.pass.TypesInfo.ObjectOf(lockIdent); lockObj != nil {
+			if selectorParent, ok := parentOf(selector); ok {
+				if root, ok := findRootObj(selectorParent, l.pass); ok {
+					if kind.isLocking(funcName) {
+						l.lock(lockObj, root, heldLock{
+							isRead:   funcName[0] == 'R',
+							kind:     kind,
+							selector: selector,
+						})
+					} else if kind.isUnlocking(funcName) {
+						if l.isWithinDeferScope() {
+							l.deferredUnlock(lockObj, root, heldLock{
+								kind:     kind,
+								selector: selector,
+							})
+						} else {
+							l.unlock(lockObj, root, heldLock{
+								isRead:   funcName[0] == 'R',
+								kind:     kind,
+								selector: selector,
+							})
+						}
+					}
+				}
+			}
+		}
 	}
 }
 

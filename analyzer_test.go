@@ -1,6 +1,7 @@
 package lockgaurd
 
 import (
+	"fmt"
 	"go/parser"
 	"testing"
 
@@ -47,20 +48,26 @@ func TestTrimExpr(t *testing.T) {
 }
 
 func TestDirectiveParsing(t *testing.T) {
-	value, ok := parseDirective("//lockguard:protected_by s.mu")
-	assert.Assert(t, ok)
-	assert.Equal(t, value, "s.mu")
+	for _, directive := range protectionDirectives {
+		parsedDirective, value, ok := parseCommentDirective(fmt.Sprintf("//lockguard:%s s.mu", directive))
+		assert.Assert(t, ok)
+		assert.Equal(t, directive, parsedDirective)
+		assert.Equal(t, value, "s.mu")
+	}
 
-	value, ok = parseDirective("//lockguard:protected_by mu")
+	_, value, ok := parseCommentDirective("//lockguard:protected_by mu")
 	assert.Assert(t, ok)
 	assert.Equal(t, value, "mu")
 
-	_, ok = parseDirective("//lockguard:protected_by")
+	_, _, ok = parseCommentDirective("//lockguard:protected_by")
 	assert.Assert(t, !ok)
 
-	_, ok = parseDirective("// lockguard:protected_by s.mu")
+	_, _, ok = parseCommentDirective("// lockguard:protected_by s.mu")
 	assert.Assert(t, !ok)
 
-	_, ok = parseDirective("/*lockguard:protected_by s.mu*/")
+	_, _, ok = parseCommentDirective("/*lockguard:protected_by s.mu*/")
+	assert.Assert(t, !ok)
+
+	_, _, ok = parseCommentDirective("//lockguard:guarded_by s.mu")
 	assert.Assert(t, !ok)
 }

@@ -10,23 +10,27 @@ type valueParser struct {
 	pos int
 }
 
-func parseDirective(text string) (string, bool) {
-	// Parse directive, which looks like: "//lockguard:protected_by s1.mu". We want to return "s1.mu"
-
+func parseCommentDirective(text string) (protectionDirective, string, bool) {
+	// What we're looking for is something like: "//lockguard:protected_by s1.mu".
 	p := valueParser{
 		s:   strings.TrimSpace(text),
 		pos: 0,
 	}
 
-	// TODO we'll need to change this when we add new directives.
-	if !p.consume("//lockguard:protected_by") {
-		return "", false
+	if !p.consume("//lockguard:") {
+		return "", "", false
 	}
-	p.skipWhiteSpace()
-	if p.done() {
-		return "", false
+
+	for _, directive := range protectionDirectives {
+		if p.consume(string(directive)) {
+			p.skipWhiteSpace()
+			if p.done() {
+				return "", "", false
+			}
+			return directive, p.s[p.pos:], true
+		}
 	}
-	return p.s[p.pos:], true
+	return "", "", false
 }
 
 func (p *valueParser) consume(t string) bool {
