@@ -401,3 +401,74 @@ func (s *S5) readWriteLockUnlock() {
 	s.rw++
 	s.mut.Unlock()
 }
+
+type S6 struct {
+	i int `protected_by:"Mutex"`
+	sync.Mutex
+}
+
+func (s *S6) lockUnlockEmbeddedField() {
+	s.i++ // want `Mutex is not held while accessing i`
+
+	s.Mutex.Lock()
+	s.i++
+	s.Mutex.Unlock()
+
+	s.Lock()
+	s.i++
+	s.Unlock()
+}
+
+type S7 struct {
+	i  int `protected_by:"s6.Mutex"`
+	s6 S6
+}
+
+func (s *S7) lockUnlockEmbeddedField() {
+	s.i++ // want `Mutex is not held while accessing i`
+
+	s.s6.Lock()
+	s.i++
+	s.s6.Unlock()
+
+	s.s6.Mutex.Lock()
+	s.i++
+	s.s6.Mutex.Unlock()
+}
+
+type S8 struct {
+	i int `protected_by:"Mutex"`
+	sync.Mutex
+}
+
+func (s *S8) f() {
+	s.Lock()
+	s.i++
+	s.Unlock()
+}
+
+type Inner struct {
+	i int `protected_by:"Mutex"`
+	sync.Mutex
+}
+
+type S9 struct {
+	Inner `protected_by:"mu"` // want Inner:"mu"
+	mu    sync.Mutex
+}
+
+func (s *S9) hiddenProtectedField() {
+	s.i++ // want `mu is not held while accessing Inner` `Mutex is not held while accessing i`
+
+	s.Lock()   // want `mu is not held while accessing Inner`
+	s.i++      // want `mu is not held while accessing Inner`
+	s.Unlock() // want `mu is not held while accessing Inner`
+
+	s.mu.Lock()
+	s.Lock()
+	s.i++
+	s.Unlock()
+	s.mu.Unlock()
+}
+
+// TODO S1{}.i

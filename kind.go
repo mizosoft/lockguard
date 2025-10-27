@@ -9,9 +9,9 @@ import (
 type lockKind int
 
 const (
-	rwLockKind lockKind = iota
+	noneLockKind lockKind = iota
+	rwLockKind
 	normalLockKind
-	noneLockKind
 )
 
 func (kind lockKind) String() string {
