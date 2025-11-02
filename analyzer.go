@@ -111,8 +111,6 @@ func (l *lockAnalyzer) currentAccess() accessKind {
 // TODO a wild idea: consider pointer assignment paths to check if we're referring to the same lock without
 //      necessarily locking/unlocking it with the same expr.
 
-// TODO too much panics
-
 func (l *lockAnalyzer) analyze(cursor inspector.Cursor) {
 	for c := range cursor.Preorder((*ast.File)(nil)) {
 		l.currentFile = c.Node().(*ast.File)
@@ -140,8 +138,8 @@ func (l *lockAnalyzer) analyzeDecl(decl ast.Decl) {
 					lockPath = append(canonicalPath{recv}, lockPath...)
 				}
 
-				l.currentLockScope().apply(copyAppend(lockPath, locateFromObjByName(prot.lockObj(), lockFunc, true)...))
-				l.currentLockScope().applyDeferred(copyAppend(lockPath, locateFromObjByName(prot.lockObj(), unlockFunc, true)...))
+				l.currentLockScope().apply(copyAppend(lockPath, locateFromObjByName(prot.lockObj(), lockFunc)...))
+				l.currentLockScope().applyDeferred(copyAppend(lockPath, locateFromObjByName(prot.lockObj(), unlockFunc)...))
 			}
 		}
 
@@ -360,8 +358,7 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 	case *ast.SelectorExpr:
 		l.analyzeExpr(expr.X)
 
-		// Fallback to file imports as TypesInfo.ObjectOf doesn't locate imported PkgName objects.
-		loc := infoLocator(l.pass.TypesInfo).fallback(importsLocator(l.currentFile, l.pass.TypesInfo))
+		loc := infoLocator(l.pass.TypesInfo)
 
 		xPath := loc.canonicalize(expr.X)
 		if xPath == nil {
@@ -371,7 +368,7 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 
 		switch obj := l.pass.TypesInfo.ObjectOf(expr.Sel).(type) {
 		case *types.Var:
-			fieldPath := locateFromObjByName(xPath[len(xPath)-1], obj.Name(), false)
+			fieldPath := locateFromObjByName(xPath[len(xPath)-1], obj.Name())
 			if fieldPath == nil {
 				fmt.Println("Unresolvable selector1", types.ExprString(expr.Sel), types.ExprString(expr))
 				return
@@ -396,7 +393,7 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 				}
 			}
 		case *types.Func:
-			funcPath := locateFromObjByName(xPath[len(xPath)-1], obj.Name(), true)
+			funcPath := locateFromObjByName(xPath[len(xPath)-1], obj.Name())
 			if funcPath == nil {
 				fmt.Println("Unresolvable selector:", types.ExprString(expr.Sel), types.ExprString(expr))
 				return

@@ -72,7 +72,7 @@ func (s *lockScope) apply(path canonicalPath) (warnings []string) {
 		for i := len(path) - 2; i >= 0; i-- {
 			// Check if the locking/unlocking function is defined (directly or indirectly through embedded fields) by
 			// this object.
-			pathFromObj := locateFromObjByName(path[i], op.funcName(), true)
+			pathFromObj := locateFromObjByName(path[i], op.funcName())
 			if pathFromObj == nil {
 				return
 			}
@@ -124,7 +124,7 @@ func (s *lockScope) apply(path canonicalPath) (warnings []string) {
 		for i := len(path) - 2; i >= 0; i-- {
 			// Check if the locking/unlocking function is defined (directly or indirectly through embedded fields) by
 			// this object's type.
-			pathFromObj := locateFromObjByName(path[i], op.funcName(), true)
+			pathFromObj := locateFromObjByName(path[i], op.funcName())
 			if pathFromObj == nil {
 				return
 			}
@@ -220,7 +220,7 @@ func isLockOpPath(path canonicalPath) bool {
 	// Check there's at least one Lock or RLock node from the end and that op is transferable through the
 	// remaining suffix to that node.
 	for i := len(path) - 2; i >= 0; i-- {
-		pathToOp := locateFromObjByName(path[i], op.funcName(), true)
+		pathToOp := locateFromObjByName(path[i], op.funcName())
 		if !slices.Equal(path[i+1:], pathToOp) {
 			return false
 		}

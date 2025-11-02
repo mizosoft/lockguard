@@ -21,18 +21,18 @@ func (c canonicalPath) String() string {
 	return str
 }
 
-type locator func(name *ast.Ident, inCall bool) canonicalPath
+type locator func(name *ast.Ident) canonicalPath
 
-var nilLocator locator = func(name *ast.Ident, inCall bool) canonicalPath {
+var nilLocator locator = func(name *ast.Ident) canonicalPath {
 	return nil
 }
 
 func (l locator) fallback(f locator) locator {
-	return func(name *ast.Ident, inCall bool) canonicalPath {
-		if obj := l(name, inCall); obj != nil {
+	return func(name *ast.Ident) canonicalPath {
+		if obj := l(name); obj != nil {
 			return obj
 		}
-		return f(name, inCall)
+		return f(name)
 	}
 }
 
@@ -51,14 +51,14 @@ func objLocator(obj types.Object) locator {
 	return nilLocator
 }
 
-func locateFromObj(obj types.Object, ident *ast.Ident, inCall bool) canonicalPath {
-	return objLocator(obj)(ident, inCall)
+func locateFromObj(obj types.Object, ident *ast.Ident) canonicalPath {
+	return objLocator(obj)(ident)
 }
 
-func locateFromObjByName(obj types.Object, name string, inCall bool) canonicalPath {
+func locateFromObjByName(obj types.Object, name string) canonicalPath {
 	return locateFromObj(obj, &ast.Ident{
 		Name: name,
-	}, inCall)
+	})
 }
 
 func structLocator(typ *types.Struct, def *types.Named) locator {
@@ -66,8 +66,8 @@ func structLocator(typ *types.Struct, def *types.Named) locator {
 		return nilLocator
 	}
 
-	return func(name *ast.Ident, inCall bool) canonicalPath {
-		if _, path := findStructObj(typ, def, name.Name, inCall); path != nil {
+	return func(name *ast.Ident) canonicalPath {
+		if path := findStructObj(typ, def, name.Name); path != nil {
 			return path
 		}
 		return nil
@@ -79,7 +79,7 @@ func scopeLocator(scope *types.Scope) locator {
 		return nilLocator
 	}
 
-	return func(name *ast.Ident, inCall bool) canonicalPath {
+	return func(name *ast.Ident) canonicalPath {
 		if _, obj := scope.LookupParent(name.Name, token.NoPos); obj != nil {
 			return canonicalPath{obj}
 		}
@@ -92,7 +92,7 @@ func importsLocator(file *ast.File, info *types.Info) locator {
 		return nilLocator
 	}
 
-	return func(name *ast.Ident, inCall bool) canonicalPath {
+	return func(name *ast.Ident) canonicalPath {
 		for _, spec := range file.Imports {
 			if pkgName := info.PkgNameOf(spec); pkgName != nil && pkgName.Name() == name.Name {
 				return canonicalPath{pkgName}
@@ -107,7 +107,7 @@ func infoLocator(info *types.Info) locator {
 		return nilLocator
 	}
 
-	return func(name *ast.Ident, inCall bool) canonicalPath {
+	return func(name *ast.Ident) canonicalPath {
 		if obj := info.ObjectOf(name); obj != nil {
 			return canonicalPath{obj}
 		}
@@ -116,28 +116,24 @@ func infoLocator(info *types.Info) locator {
 }
 
 func (l locator) canonicalize(expr ast.Expr) canonicalPath {
-	return l.canonicalizeHelper(expr, false)
-}
-
-// TODO make findField/findFunc return the partial path if lookup failed, to present a proper error.
-
-func (l locator) canonicalizeHelper(expr ast.Expr, inCall bool) canonicalPath {
 	switch expr := expr.(type) {
 	case *ast.Ident:
-		return l(expr, inCall)
+		return l(expr)
 	case *ast.SelectorExpr:
-		if parentPath := l.canonicalizeHelper(expr.X, false); parentPath != nil {
-			if subPath := objLocator(parentPath[len(parentPath)-1])(expr.Sel, inCall); subPath != nil {
+		if parentPath := l.canonicalize(expr.X); parentPath != nil {
+			if subPath := objLocator(parentPath[len(parentPath)-1])(expr.Sel); subPath != nil {
 				return append(parentPath, subPath...)
 			}
 		}
 	case *ast.CallExpr:
-		return l.canonicalizeHelper(expr.Fun, true)
+		return l.canonicalize(expr.Fun)
 	case *ast.ParenExpr:
-		return l.canonicalizeHelper(expr.X, inCall)
+		return l.canonicalize(expr.X)
 	}
 	return nil
 }
+
+// TODO make findField/findFunc return the partial path if lookup failed, to present a proper error.
 
 func typeOf(obj types.Object) (*types.Struct, *types.Named) {
 	switch obj := obj.(type) {
@@ -175,17 +171,9 @@ func fieldTypeOf(field *types.Var) (*types.Struct, *types.Named) {
 	return strct, def
 }
 
-func findStructObj(rootTyp *types.Struct, rootDef *types.Named, name string, inCall bool) (types.Object, canonicalPath) {
-	if inCall {
-		return findStructFunc(rootTyp, rootDef, name)
-	} else {
-		return findStructField(rootTyp, name)
-	}
-}
-
-func findStructField(rootTyp *types.Struct, name string) (*types.Var, canonicalPath) {
+func findStructObj(rootTyp *types.Struct, rootDef *types.Named, name string) canonicalPath {
 	if rootTyp == nil {
-		return nil, nil
+		return nil
 	}
 
 	q := make([]*types.Var, 0)
@@ -196,66 +184,15 @@ func findStructField(rootTyp *types.Struct, name string) (*types.Var, canonicalP
 
 	for field := range rootTyp.Fields() {
 		if field.Name() == name { // Short-circuit.
-			return field, canonicalPath{field}
-		} else {
-			q = append(q, field)
-			parent[field] = nil // nil here signifies an imaginary root.
+			return canonicalPath{field}
 		}
 	}
 
-	// Begin multi-source BFS, level-by-level.
-	for len(q) > 0 {
-		var matchedField *types.Var
-		for ln := len(q); ln > 0; ln-- {
-			field := q[0]
-			q = q[1:]
-			if field.Name() == name {
-				if matchedField == nil {
-					matchedField = field
-				} else {
-					return nil, nil // Ambiguous reference.
-				}
-			} else if field.Embedded() {
-				// Follow path
-				typ, _ := fieldTypeOf(field)
-				if typ == nil { // Can't complete the search.
-					return nil, nil
-				}
-				for subField := range typ.Fields() {
-					if _, ok := parent[subField]; !ok {
-						q = append(q, subField)
-						parent[subField] = field
-					}
-				}
+	if rootDef != nil {
+		for method := range rootDef.Methods() {
+			if method.Name() == name {
+				return canonicalPath{method} // Short-circuit
 			}
-		}
-
-		if matchedField != nil { // Found field.
-			var path canonicalPath
-			for curr := matchedField; curr != (*types.Var)(nil); curr = parent[curr] {
-				path = append(path, curr)
-			}
-			slices.Reverse(path)
-			return matchedField, path
-		}
-	}
-	return nil, nil
-}
-
-func findStructFunc(rootTyp *types.Struct, rootDef *types.Named, name string) (*types.Func, canonicalPath) {
-	if rootTyp == nil || rootDef == nil {
-		return nil, nil
-	}
-
-	q := make([]types.Object, 0)
-
-	// This map serves a two-fold purpose: tracking visited fields so we don't endlessly follow
-	// cycles, and recording which fields led to which so we can re-construct the path.
-	parent := make(map[types.Object]*types.Var)
-
-	for method := range rootDef.Methods() {
-		if method.Name() == name { // Short-circuit.
-			return method, canonicalPath{method}
 		}
 	}
 
@@ -268,52 +205,59 @@ func findStructFunc(rootTyp *types.Struct, rootDef *types.Named, name string) (*
 
 	// Begin multi-source BFS, level-by-level.
 	for len(q) > 0 {
-		var matchedMethod *types.Func
-		for ln := len(q); ln > 0; ln-- {
-			obj := q[0]
+		var matchedObj types.Object
+		var matchedObjOwner *types.Var
+		for ln := len(q) - 1; ln >= 0; ln-- {
+			field := q[0]
 			q = q[1:]
-			switch obj := obj.(type) {
-			case *types.Func:
-				if obj.Name() == name {
-					if matchedMethod == nil {
-						matchedMethod = obj
+
+			typ, def := fieldTypeOf(field)
+			if typ == nil {
+				continue
+			}
+
+			for subField := range typ.Fields() {
+				if subField.Name() == name { // Short-circuit.
+					if matchedObj == nil {
+						matchedObj = subField // Ambiguous reference.
+						matchedObjOwner = field
 					} else {
-						return nil, nil // Ambiguous reference.
+						return nil
 					}
 				}
-			case *types.Var:
-				// Follow path
-				typ, def := fieldTypeOf(obj)
-				if typ == nil || def == nil { // Can't complete the search.
-					return nil, nil
-				}
+			}
 
-				for meth := range def.Methods() {
-					q = append(q, meth)
-					parent[meth] = obj
-				}
-
-				for subField := range typ.Fields() {
-					if subField.Embedded() {
-						if _, ok := parent[subField]; !ok {
-							q = append(q, subField)
-							parent[subField] = obj
+			if rootDef != nil {
+				for method := range def.Methods() {
+					if method.Name() == name {
+						if matchedObj == nil {
+							matchedObj = method
+							matchedObjOwner = field
+						} else {
+							return nil
 						}
 					}
 				}
 			}
-		}
 
-		if matchedMethod != nil { // Found field.
-			var path canonicalPath
-			for curr := types.Object(matchedMethod); curr != (*types.Var)(nil); curr = parent[curr] {
-				path = append(path, curr)
+			for subField := range typ.Fields() {
+				if subField.Embedded() {
+					q = append(q, subField)
+					parent[subField] = field
+				}
 			}
-			slices.Reverse(path)
-			return matchedMethod, path
+
+			if matchedObj != nil { // Found field.
+				path := canonicalPath{matchedObj}
+				for curr := matchedObjOwner; curr != (*types.Var)(nil); curr = parent[curr] {
+					path = append(path, curr)
+				}
+				slices.Reverse(path)
+				return path
+			}
 		}
 	}
-	return nil, nil
+	return nil
 }
 
 func removePointer(typ types.Type) types.Type {
