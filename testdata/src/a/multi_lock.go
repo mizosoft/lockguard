@@ -2,7 +2,7 @@ package a
 
 import "sync"
 
-type multiLock struct {
+type withMultipleLocks struct {
 	a   int `protected_by:"mu1"`
 	b   int `protected_by:"mu2"`
 	c   int `protected_by:"mu1"`
@@ -11,7 +11,7 @@ type multiLock struct {
 	mu2 sync.Mutex
 }
 
-func (m *multiLock) wrongLock() {
+func (m *withMultipleLocks) wrongLock() {
 	m.mu1.Lock()
 	m.a++ // OK
 	m.b++ // want `mu2 is not held while accessing b`
@@ -19,7 +19,7 @@ func (m *multiLock) wrongLock() {
 	m.mu1.Unlock()
 }
 
-func (m *multiLock) bothLocks() {
+func (m *withMultipleLocks) bothLocks() {
 	m.mu1.Lock()
 	m.mu2.Lock()
 	m.a++ // OK
@@ -29,7 +29,7 @@ func (m *multiLock) bothLocks() {
 	m.mu1.Unlock()
 }
 
-func (m *multiLock) lockOrdering() {
+func (m *withMultipleLocks) lockOrdering() {
 	m.mu1.Lock()
 	m.a++ // OK
 	m.mu1.Unlock()

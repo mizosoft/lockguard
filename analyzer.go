@@ -5,6 +5,7 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"strings"
 
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/inspect"
@@ -55,15 +56,6 @@ func ancestorAs[N ast.Node](l *lockAnalyzer, upDepth int) (N, bool) {
 	}
 	typedParent, ok := parent.(N)
 	return typedParent, ok
-}
-
-func closest[N ast.Node](l *lockAnalyzer) (N, bool) {
-	for i := len(l.stack) - 1; i >= 0; i-- {
-		if typed, ok := l.stack[i].(N); ok {
-			return typed, true
-		}
-	}
-	return nillOf[N](), false
 }
 
 type accessKind int
@@ -430,12 +422,12 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 			}
 
 			// Check if this is a lock or unlock call.
-			if _, isCall := ancestorAs[*ast.CallExpr](l, 1); isCall && isLockOpPath(path) {
+			if call, isCall := ancestorAs[*ast.CallExpr](l, 1); isCall && isLockOpPath(path) {
 				scope := l.currentLockScope()
 				if l.isWithinDeferScope() {
 					scope.applyDeferred(path)
-				} else {
-					scope.apply(path)
+				} else if warnings := scope.apply(path); len(warnings) > 0 {
+					l.pass.Reportf(call.Pos(), "%s", strings.Join(warnings, ", "))
 				}
 			}
 		}

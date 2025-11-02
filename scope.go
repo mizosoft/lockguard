@@ -1,18 +1,11 @@
 package lockgaurd
 
 import (
+	"fmt"
 	"go/types"
 	"slices"
 
 	"golang.org/x/tools/go/analysis"
-)
-
-type lockState = int
-
-const (
-	unlockedLockState lockState = iota
-	lockedLockState
-	rLockedLockState
 )
 
 type lockOp int
@@ -62,21 +55,20 @@ func newLockScope(pass *analysis.Pass) *lockScope {
 			node: node{
 				children: make(map[types.Object]*node),
 				obj:      nil, // nil identifies root (global scope).
-				state:    unlockedLockState,
 			},
 		},
 		pass: pass,
 	}
 }
 
-func (s *lockScope) apply(path canonicalPath) {
+func (s *lockScope) apply(path canonicalPath) (warnings []string) {
 	if !isLockOpPath(path) {
 		return
 	}
 
 	switch op := lockOpOf(path[len(path)-1].Name()); op {
 	case lockLockOp, rLockLockOp:
-		treePath := s.tree.add(path)
+		treePath := s.tree.add(path[:len(path)-1])
 		for i := len(path) - 2; i >= 0; i-- {
 			// Check if the locking/unlocking function is defined (directly or indirectly through embedded fields) by
 			// this object.
@@ -93,11 +85,19 @@ func (s *lockScope) apply(path canonicalPath) {
 				continue
 			}
 
-			// TODO warn about double-locking.
+			nd := treePath[i]
 			if op == lockLockOp && (kind == normalLockKind || kind == rwLockKind) {
-				treePath[i].state = lockedLockState
-			} else if op == rLockLockOp && kind == rwLockKind {
-				treePath[i].state = rLockedLockState
+				if nd.lockCount >= 1 {
+					warnings = append(warnings, fmt.Sprintf("deadlock: %v - already locked", nd.obj.Name()))
+				} else if nd.rLockCount >= 1 {
+					warnings = append(warnings, fmt.Sprintf("deadlock: %v - already read-locked", nd.obj.Name()))
+				}
+				nd.lockCount++
+			} else if kind == rwLockKind { // op is rLockLockOp
+				if nd.lockCount >= 1 {
+					warnings = append(warnings, fmt.Sprintf("deadlock: %v - already locked", nd.obj.Name()))
+				}
+				nd.rLockCount++
 			}
 
 			// Break if lock state is not transferable upwards.
@@ -111,9 +111,13 @@ func (s *lockScope) apply(path canonicalPath) {
 			}
 		}
 	case unlockLockOp, rUnlockLockOp:
-		treePath := s.tree.follow(path)
+		treePath := s.tree.follow(path[:len(path)-1])
 		if len(treePath) == 0 {
-			// TODO warn about unlocking a non-locked lock.
+			if op == unlockLockOp {
+				warnings = append(warnings, fmt.Sprintf("%v - unlocking a non-locked lock", path[len(path)-2].Name()))
+			} else {
+				warnings = append(warnings, fmt.Sprintf("%v - read-unlocking a non-read-locked lock", path[len(path)-2].Name()))
+			}
 			return
 		}
 
@@ -133,11 +137,17 @@ func (s *lockScope) apply(path canonicalPath) {
 				continue
 			}
 
-			if i < len(treePath) {
-				if (treePath[i].state == lockedLockState && op == unlockLockOp) ||
-					(treePath[i].state == rLockedLockState && op == rUnlockLockOp) {
-					treePath[i].state = unlockedLockState
+			nd := treePath[i]
+			if op == unlockLockOp {
+				if nd.lockCount <= 0 {
+					warnings = append(warnings, fmt.Sprintf("%v - unlocking a non-locked lock", nd.obj.Name()))
+				} else {
+					nd.lockCount--
 				}
+			} else if nd.rLockCount <= 0 {
+				warnings = append(warnings, fmt.Sprintf("%v - read-unlocking a non-read-locked lock", nd.obj.Name()))
+			} else {
+				nd.rLockCount--
 			}
 
 			// Break if lock state is not transferable upwards.
@@ -185,13 +195,7 @@ func (s *lockScope) missedProtections(objectPath canonicalPath, prots []protecti
 		}
 
 		nd := treePath[len(treePath)-1]
-		state := nd.state
-		if state == unlockedLockState {
-			missedProts = append(missedProts, prot)
-			continue
-		}
-
-		if !prot.directive.isSatisfiedBy(lockKindOfObject(nd.obj), state == rLockedLockState, access) {
+		if (nd.lockCount == 0 && nd.rLockCount == 0) || !prot.directive.isSatisfiedBy(lockKindOfObject(nd.obj), nd.lockCount == 0, access) {
 			missedProts = append(missedProts, prot)
 			continue
 		}
@@ -243,7 +247,6 @@ func (t *lockTree) add(path canonicalPath) []*node {
 			next = &node{
 				children: make(map[types.Object]*node),
 				obj:      obj,
-				state:    unlockedLockState,
 			}
 			curr.children[obj] = next
 			curr = next
@@ -268,7 +271,8 @@ func (t *lockTree) follow(path canonicalPath) []*node {
 }
 
 type node struct {
-	children map[types.Object]*node
-	obj      types.Object // Node object, nil for root.
-	state    lockState
+	children   map[types.Object]*node
+	obj        types.Object // Node object, nil for root.
+	lockCount  int          // Typically either 0 or 1. Warnings are emitted if it gets above 1.
+	rLockCount int
 }
