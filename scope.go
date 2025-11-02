@@ -1,7 +1,6 @@
 package lockgaurd
 
 import (
-	"fmt"
 	"go/types"
 	"slices"
 
@@ -29,18 +28,13 @@ const (
 var lockOps = []lockOp{lockLockOp, unlockLockOp, rLockLockOp, rUnlockLockOp}
 
 func (o lockOp) funcName() string {
-	switch o {
-	case lockLockOp:
-		return "Lock"
-	case unlockLockOp:
-		return "Unlock"
-	case rLockLockOp:
-		return "RLock"
-	case rUnlockLockOp:
-		return "RUnlock"
-	default:
-		panic(fmt.Sprintf("unknown op: %d", o))
-	}
+	return [...]string{
+		noneLockOp:    "<invalid>",
+		lockLockOp:    "Lock",
+		unlockLockOp:  "Unlock",
+		rLockLockOp:   "RLock",
+		rUnlockLockOp: "RUnlock",
+	}[o]
 }
 
 func (o lockOp) String() string {
@@ -91,13 +85,12 @@ func (s *lockScope) apply(lockPath canonicalPath, op lockOp) {
 		treePath := s.tree.add(lockPath)
 		for i := len(lockPath) - 1; i >= 0; i-- {
 			// Check if the locking/unlocking function is defined (directly or indirectly through embedded fields) by
-			// this object's type.
-			context, contextDef := typeOf(lockPath[i])
-			opFunc, pathFromObj := findFuncWithPath(context, contextDef, op.funcName())
+			// this object.
+			pathFromObj := locateFromObjByName(lockPath[i], op.funcName(), true)
 			if pathFromObj == nil {
 				return
 			}
-			if !slices.Equal(append(lockPath[i+1:], opFunc), pathFromObj) {
+			if !slices.Equal(lockPath[i+1:], pathFromObj[:len(pathFromObj)-1]) {
 				return // Op is not transferable.
 			}
 
@@ -119,7 +112,7 @@ func (s *lockScope) apply(lockPath canonicalPath, op lockOp) {
 				if !obj.Embedded() {
 					return
 				}
-			case *types.Func:
+			case *types.Func, *types.PkgName:
 				return
 			}
 		}
@@ -133,13 +126,12 @@ func (s *lockScope) apply(lockPath canonicalPath, op lockOp) {
 		for i := len(lockPath) - 1; i >= 0; i-- {
 			// Check if the locking/unlocking function is defined (directly or indirectly through embedded fields) by
 			// this object's type.
-			context, contextDef := typeOf(lockPath[i])
-			opFunc, pathFromObj := findFuncWithPath(context, contextDef, op.funcName())
+			pathFromObj := locateFromObjByName(lockPath[i], op.funcName(), true)
 			if pathFromObj == nil {
 				return
 			}
-			if !slices.Equal(append(lockPath[i+1:], opFunc), pathFromObj) {
-				return
+			if !slices.Equal(lockPath[i+1:], pathFromObj[:len(pathFromObj)-1]) {
+				return // Op is not transferable.
 			}
 
 			kind := lockKindOfObject(lockPath[i])
@@ -160,7 +152,7 @@ func (s *lockScope) apply(lockPath canonicalPath, op lockOp) {
 				if !obj.Embedded() {
 					return
 				}
-			case *types.Func:
+			case *types.Func, *types.PkgName:
 				return
 			}
 		}
@@ -182,25 +174,33 @@ func (s *lockScope) flushDeferred() {
 	s.deferredOp = nil
 }
 
-func (s *lockScope) isProtected(objectPath canonicalPath, prots []protection, access accessKind) bool {
+func (s *lockScope) missedProtections(objectPath canonicalPath, prots []protection, access accessKind) []protection {
+	if len(objectPath) == 0 {
+		return nil // Vacuously
+	}
+
+	var missedProts []protection
 	for _, prot := range prots {
-		lockPath := append(objectPath[:len(objectPath)-1], prot.lockPath...)
+		lockPath := copyAppend(objectPath[:len(objectPath)-1], prot.lockPath...)
 		treePath := s.tree.follow(lockPath)
-		if len(treePath) != len(lockPath) {
-			return false
+		if len(lockPath) != len(treePath) {
+			missedProts = append(missedProts, prot)
+			continue
 		}
 
 		nd := treePath[len(treePath)-1]
 		state := nd.state
 		if state == unlockedLockState {
-			return false
+			missedProts = append(missedProts, prot)
+			continue
 		}
 
 		if !prot.directive.isSatisfiedBy(lockKindOfObject(nd.obj), state == rLockedLockState, access) {
-			return false
+			missedProts = append(missedProts, prot)
+			continue
 		}
 	}
-	return true
+	return missedProts
 }
 
 func isLockPath(lockPath canonicalPath, op lockOp) bool {
@@ -211,9 +211,8 @@ func isLockPath(lockPath canonicalPath, op lockOp) bool {
 	// Check there's at least one Lock or RLock node from the end and that op is transferable through the
 	// remaining suffix.
 	for i := len(lockPath) - 1; i >= 0; i-- {
-		context, contextDef := typeOf(lockPath[len(lockPath)-1])
-		opFunc, pathToOp := findFuncWithPath(context, contextDef, op.funcName())
-		if !slices.Equal(append(lockPath[i+1:], opFunc), pathToOp) {
+		pathToOp := locateFromObjByName(lockPath[len(lockPath)-1], op.funcName(), true)
+		if !slices.Equal(lockPath[i+1:], pathToOp[:len(pathToOp)-1]) {
 			return false
 		}
 

@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"go/ast"
 	"go/parser"
+	"go/token"
 	"go/types"
-	"iter"
 	"reflect"
 	"strings"
 
@@ -68,26 +68,19 @@ type protection struct {
 	// The path locating the canonical lockObj.
 	lockPath canonicalPath
 
-	// The expression specified by the directive.
-	lockExpr ast.Expr
-
-	// Only non-nil for guarded functions with receivers.
-	lockExprWithReceiver ast.Expr
+	// True if the function receiver is the first object in lockPath.
+	withReceiver bool
 }
 
-func (p *protection) lockExprString() string {
-	if p.lockExprWithReceiver != nil {
-		return types.ExprString(p.lockExprWithReceiver)
-	} else {
-		return types.ExprString(p.lockExpr)
-	}
+func (p protection) lockExprString() string {
+	return p.lockPath.String()
 }
 
-func (p *protection) String() string {
+func (p protection) String() string {
 	return p.lockExprString()
 }
 
-func (p *protection) defaultLockUnlockFuncs() (string, string) {
+func (p protection) defaultLockUnlockFuncs() (string, string) {
 	switch p.directive {
 	case protectedBy, writeProtectedBy:
 		return "Lock", "Unlock"
@@ -99,13 +92,13 @@ func (p *protection) defaultLockUnlockFuncs() (string, string) {
 }
 
 type protectionFact struct {
-	prot protection
+	prots []protection
 }
 
-func (p *protectionFact) AFact() {}
+func (p protectionFact) AFact() {}
 
-func (p *protectionFact) String() string {
-	return p.prot.String()
+func (p protectionFact) String() string {
+	return fmt.Sprintf("%v", p.prots)
 }
 
 type protectionsFinder struct {
@@ -121,23 +114,51 @@ func newFinder(pass *analysis.Pass) protectionsFinder {
 }
 
 func (f *protectionsFinder) find(ins *inspector.Inspector) {
-	ins.Root().Inspect([]ast.Node{(*ast.StructType)(nil), (*ast.FuncDecl)(nil)}, func(c inspector.Cursor) (descend bool) {
-		switch n := c.Node().(type) {
-		case *ast.StructType:
-			if specCursor, ok := lastOf(c.Enclosing((*ast.TypeSpec)(nil))); ok {
-				f.findStructProtections(n, specCursor.Node().(*ast.TypeSpec))
-			} else {
-				f.findStructProtections(n, nil)
+	ins.Root().Inspect([]ast.Node{(*ast.StructType)(nil), (*ast.GenDecl)(nil), (*ast.FuncDecl)(nil)},
+		func(c inspector.Cursor) bool {
+			var file *ast.File
+			if fileCursor, ok := lastOf(c.Enclosing((*ast.File)(nil))); ok {
+				file = fileCursor.Node().(*ast.File)
 			}
-		case *ast.FuncDecl:
-			f.findFuncProtection(n)
-		}
-		return true
-	})
+
+			switch n := c.Node().(type) {
+			case *ast.StructType:
+				// Find the containing definition (TypeSpec) if any.
+				if specCursor, ok := lastOf(c.Enclosing((*ast.TypeSpec)(nil))); ok {
+					f.findStructProtections(n, specCursor.Node().(*ast.TypeSpec), f.enclosingScopeOf(specCursor), file)
+				} else {
+					f.findStructProtections(n, nil, f.enclosingScopeOf(c), file)
+				}
+			case *ast.GenDecl:
+				f.findVarDeclProtections(n, file)
+			case *ast.FuncDecl:
+				f.findFuncProtections(n, file)
+			}
+			return true
+		})
 }
 
-func (f *protectionsFinder) findStructProtections(structType *ast.StructType, spec *ast.TypeSpec) {
-	strct, ok := f.pass.TypesInfo.TypeOf(structType).(*types.Struct)
+func (f *protectionsFinder) enclosingScopeOf(c inspector.Cursor) *types.Scope {
+	if scopeNode, ok := lastOf(c.Parent().Enclosing(
+		(*ast.File)(nil),
+		(*ast.FuncType)(nil),
+		(*ast.TypeSpec)(nil),
+		(*ast.BlockStmt)(nil),
+		(*ast.IfStmt)(nil),
+		(*ast.SwitchStmt)(nil),
+		(*ast.TypeSwitchStmt)(nil),
+		(*ast.CaseClause)(nil),
+		(*ast.CommClause)(nil),
+		(*ast.ForStmt)(nil),
+		(*ast.RangeStmt)(nil),
+	)); ok {
+		return f.pass.TypesInfo.Scopes[scopeNode.Node()]
+	}
+	return nil
+}
+
+func (f *protectionsFinder) findStructProtections(typ *ast.StructType, spec *ast.TypeSpec, enclosingScope *types.Scope, file *ast.File) {
+	strct, ok := f.pass.TypesInfo.TypeOf(typ).(*types.Struct)
 	if !ok {
 		return
 	}
@@ -147,7 +168,9 @@ func (f *protectionsFinder) findStructProtections(structType *ast.StructType, sp
 		def = f.findStructDefinition(spec)
 	}
 
-	for _, field := range structType.Fields.List {
+	loc := structLocator(strct, def).fallback(scopeLocator(enclosingScope)).fallback(importsLocator(file, f.pass.TypesInfo))
+	for _, field := range typ.Fields.List {
+		var prots []protection
 		if field.Tag != nil {
 			for _, directive := range protectionDirectives {
 				value, ok := reflect.StructTag(strings.Trim(field.Tag.Value, "`")).Lookup(string(directive))
@@ -155,39 +178,44 @@ func (f *protectionsFinder) findStructProtections(structType *ast.StructType, sp
 					continue
 				}
 
-				prot, err := f.findProtection(strct, def, directive, value)
+				prot, err := f.findProtection(loc, directive, value)
 				if err != nil {
 					f.pass.Reportf(field.Tag.ValuePos, "%v", err)
-					return
-				}
-
-				if len(field.Names) > 0 {
-					for _, name := range field.Names {
-						if vr, ok := f.pass.TypesInfo.ObjectOf(name).(*types.Var); vr != nil && ok {
-							f.protections[vr] = append(f.protections[vr], prot)
-							fmt.Println(vr, "protected by", prot.lockPath.String())
-
-							// Export protection info as a fact to other packages.
-							if name.IsExported() {
-								f.pass.ExportObjectFact(vr, &protectionFact{
-									prot: prot,
-								})
-							}
-						}
-					}
 				} else {
-					// This is an embedded field.
-					name := nameOfEmbeddedField(field.Type)
+					prots = append(prots, prot)
+				}
+			}
+
+			if len(prots) == 0 {
+				continue
+			}
+
+			if len(field.Names) > 0 {
+				for _, name := range field.Names {
 					if vr, ok := f.pass.TypesInfo.ObjectOf(name).(*types.Var); vr != nil && ok {
-						f.protections[vr] = append(f.protections[vr], prot)
-						fmt.Println(vr, "protected by", prot.lockPath.String())
+						f.protections[vr] = prots
+						fmt.Println(vr, "protected by", fmt.Sprintf("%v", f.protections[vr]))
 
 						// Export protection info as a fact to other packages.
 						if name.IsExported() {
 							f.pass.ExportObjectFact(vr, &protectionFact{
-								prot: prot,
+								prots: prots,
 							})
 						}
+					}
+				}
+			} else {
+				// This is an embedded field.
+				name := nameOfEmbeddedField(field.Type)
+				if vr, ok := f.pass.TypesInfo.ObjectOf(name).(*types.Var); vr != nil && ok {
+					f.protections[vr] = prots
+					fmt.Println(vr, "protected by", fmt.Sprintf("%v", f.protections[vr]))
+
+					// Export protection info as a fact to other packages.
+					if name.IsExported() {
+						f.pass.ExportObjectFact(vr, &protectionFact{
+							prots: prots,
+						})
 					}
 				}
 			}
@@ -195,22 +223,8 @@ func (f *protectionsFinder) findStructProtections(structType *ast.StructType, sp
 	}
 }
 
-func nameOfEmbeddedField(typ ast.Expr) *ast.Ident {
-	switch typ := typ.(type) {
-	case *ast.Ident:
-		return typ
-	case *ast.SelectorExpr:
-		return typ.Sel
-	case *ast.StarExpr:
-		return nameOfEmbeddedField(typ.X)
-	default:
-		panic("unexpected expr: " + types.ExprString(typ))
-	}
-}
-
-func (f *protectionsFinder) findFuncProtection(funcType *ast.FuncDecl) {
-	// The function must have one receiver that is a struct.
-	if funcType.Recv.NumFields() != 1 {
+func (f *protectionsFinder) findFuncProtections(funcType *ast.FuncDecl, file *ast.File) {
+	if funcType.Doc == nil {
 		return
 	}
 
@@ -219,78 +233,126 @@ func (f *protectionsFinder) findFuncProtection(funcType *ast.FuncDecl) {
 		return
 	}
 
-	receiver, ok := f.pass.TypesInfo.ObjectOf(funcType.Recv.List[0].Names[0]).(*types.Var)
-	if !ok {
-		return
+	globalLocator := scopeLocator(f.pass.Pkg.Scope()).fallback(importsLocator(file, f.pass.TypesInfo))
+
+	var receiver *types.Var
+	if funcType.Recv != nil {
+		receiver = f.pass.TypesInfo.ObjectOf(funcType.Recv.List[0].Names[0]).(*types.Var)
 	}
 
-	receiverDef, ok := removePointer(receiver.Type()).(*types.Named)
-	if !ok {
-		return
-	}
-
-	receiverStruct, ok := removePointer(receiverDef).Underlying().(*types.Struct)
-	if !ok {
-		return
-	}
-
-	if funcType.Doc != nil {
-		for _, comment := range funcType.Doc.List {
-			if kind, value, ok := parseCommentDirective(comment.Text); ok {
-				normalizedValue, ok := strings.CutPrefix(value, receiver.Name()+".")
-				if !ok {
-					f.pass.Reportf(comment.Pos(), "expression doesn't locate a lock field")
-					return
+	for _, comment := range funcType.Doc.List {
+		if directive, value, ok := parseCommentDirective(comment.Text); ok {
+			var loc locator
+			var withReceiver bool
+			if receiver != nil {
+				if localizedValue, ok := strings.CutPrefix(value, receiver.Name()+"."); ok {
+					loc = objLocator(receiver)
+					value = localizedValue
+					withReceiver = true
 				}
+			}
 
-				prot, err := f.findProtection(receiverStruct, receiverDef, kind, normalizedValue)
-				if err != nil {
+			if loc == nil {
+				loc = globalLocator
+			}
+
+			prot, err := f.findProtection(loc, directive, value)
+			if err != nil {
+				f.pass.Reportf(comment.Pos(), "%v", err)
+				continue
+			}
+			prot.withReceiver = withReceiver
+
+			f.protections[fnc] = append(f.protections[fnc], prot)
+		}
+	}
+
+	// Export protection info as a fact to other packages.
+	if len(f.protections[fnc]) > 0 {
+		fmt.Println(fnc, "protected by", fmt.Sprintf("%v", f.protections[fnc]))
+
+		if funcType.Name.IsExported() {
+			f.pass.ExportObjectFact(fnc, &protectionFact{
+				prots: f.protections[fnc],
+			})
+		}
+	}
+}
+
+func (f *protectionsFinder) findVarDeclProtections(decl *ast.GenDecl, file *ast.File) {
+	if decl.Tok != token.VAR {
+		return
+	}
+
+	loc := scopeLocator(f.pass.Pkg.Scope()).fallback(importsLocator(file, f.pass.TypesInfo))
+
+	var declProts []protection
+	if decl.Doc != nil {
+		for _, comment := range decl.Doc.List {
+			if directive, value, ok := parseCommentDirective(comment.Text); ok {
+				if prot, err := f.findProtection(loc, directive, value); err != nil {
 					f.pass.Reportf(comment.Pos(), "%v", err)
-					return
+				} else {
+					declProts = append(declProts, prot)
 				}
+			}
+		}
+	}
 
-				lockExprWithReceiver, err := parser.ParseExpr(value)
-				if err != nil {
-					f.pass.Reportf(comment.Pos(), "%v", err)
-					return
+	for _, spec := range decl.Specs {
+		spec := spec.(*ast.ValueSpec)
+		specProts := declProts
+		if spec.Doc != nil {
+			for _, comment := range spec.Doc.List {
+				if directive, value, ok := parseCommentDirective(comment.Text); ok {
+					prot, err := f.findProtection(loc, directive, value)
+					if err != nil {
+						f.pass.Reportf(comment.Pos(), "%v", err)
+					} else {
+						specProts = append(specProts, prot)
+					}
 				}
+			}
+		}
 
-				prot.lockExprWithReceiver = lockExprWithReceiver
+		if len(specProts) > 0 {
+			for _, name := range spec.Names {
+				if vr, ok := f.pass.TypesInfo.ObjectOf(name).(*types.Var); ok {
+					f.protections[vr] = specProts
+					fmt.Println(vr, "protected by", fmt.Sprintf("%v", specProts))
 
-				f.protections[fnc] = append(f.protections[fnc], prot)
-
-				// Export protection info as a fact to other packages.
-				if funcType.Name.IsExported() {
-					f.pass.ExportObjectFact(fnc, &protectionFact{
-						prot: prot,
-					})
+					// Export protection info as a fact to other packages.
+					if name.IsExported() {
+						f.pass.ExportObjectFact(vr, &protectionFact{
+							prots: specProts,
+						})
+					}
 				}
 			}
 		}
 	}
 }
 
-func (f *protectionsFinder) findProtection(context *types.Struct, contextDef *types.Named, directive protectionDirective, value string) (protection, error) {
+func (f *protectionsFinder) findProtection(l locator, directive protectionDirective, value string) (protection, error) {
 	lockExpr, err := parser.ParseExpr(value)
 	if err != nil {
 		return protection{}, fmt.Errorf("couldn't parse protected_by expression (%s): %v", value, err)
 	}
 
-	lockPath := canonicalizeFrom(context, contextDef, lockExpr, false)
+	lockPath := l.canonicalize(lockExpr)
 	if lockPath == nil {
-		return protection{}, fmt.Errorf("invalid expression %s", directive)
+		return protection{}, fmt.Errorf("expression doesn't locate a lock field %s", value)
 	}
 
 	lockObj := lockPath[len(lockPath)-1]
 	if !directive.isSupportedBy(lockKindOfObject(lockObj)) {
-		return protection{}, fmt.Errorf("selected object's type doesn't satisfy %s", directive)
+		return protection{}, fmt.Errorf("selected object's type doesn't satisfy %b", lockObj)
 	}
 
 	return protection{
 		directive: directive,
 		lockPath:  lockPath,
 		lockObj:   lockObj,
-		lockExpr:  lockExpr,
 	}, nil
 }
 
@@ -301,14 +363,4 @@ func (f *protectionsFinder) findStructDefinition(spec *ast.TypeSpec) *types.Name
 		}
 	}
 	return nil
-}
-
-func lastOf[T any](seq iter.Seq[T]) (T, bool) {
-	var last T
-	var ok = false
-	for v := range seq {
-		last = v
-		ok = true
-	}
-	return last, ok
 }

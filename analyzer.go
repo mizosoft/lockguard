@@ -39,16 +39,9 @@ func run(pass *analysis.Pass) (interface{}, error) {
 		stack:       make([]ast.Node, 0),
 		pass:        pass,
 	}
-	ins.Preorder([]ast.Node{(*ast.FuncDecl)(nil), (*ast.GenDecl)(nil), (*ast.BadDecl)(nil)}, func(node ast.Node) {
-		l.analyzeDecl(node.(ast.Decl))
-	})
+	l.analyze(ins.Root())
 
 	return nil, nil
-}
-
-func nillOf[T any]() T {
-	var t T
-	return t
 }
 
 func ancestorAs[N ast.Node](l *lockAnalyzer, upDepth int) (N, bool) {
@@ -62,6 +55,15 @@ func ancestorAs[N ast.Node](l *lockAnalyzer, upDepth int) (N, bool) {
 	}
 	typedParent, ok := parent.(N)
 	return typedParent, ok
+}
+
+func closest[N ast.Node](l *lockAnalyzer) (N, bool) {
+	for i := len(l.stack) - 1; i >= 0; i-- {
+		if typed, ok := l.stack[i].(N); ok {
+			return typed, true
+		}
+	}
+	return nillOf[N](), false
 }
 
 type accessKind int
@@ -78,6 +80,8 @@ type lockAnalyzer struct {
 	stack       []ast.Node
 	accessStack []accessKind
 	pass        *analysis.Pass
+	cursor      inspector.Cursor
+	currentFile *ast.File
 }
 
 func (l *lockAnalyzer) enterLockScope() {
@@ -117,9 +121,18 @@ func (l *lockAnalyzer) currentAccess() accessKind {
 
 // TODO too much panics
 
+func (l *lockAnalyzer) analyze(cursor inspector.Cursor) {
+	for c := range cursor.Preorder((*ast.File)(nil)) {
+		l.currentFile = c.Node().(*ast.File)
+		for c := range c.Preorder((*ast.FuncDecl)(nil), (*ast.GenDecl)(nil), (*ast.BadDecl)(nil)) {
+			l.analyzeDecl(c.Node().(ast.Decl))
+		}
+	}
+}
+
 func (l *lockAnalyzer) analyzeDecl(decl ast.Decl) {
 	l.enter(decl)
-	defer l.leave()
+	defer l.exit()
 
 	switch decl := decl.(type) {
 	case *ast.FuncDecl:
@@ -129,13 +142,14 @@ func (l *lockAnalyzer) analyzeDecl(decl ast.Decl) {
 		// functions/variables protected by the same lock to be called within this function.
 		if fnc, ok := l.pass.TypesInfo.ObjectOf(decl.Name).(*types.Func); ok {
 			for _, prot := range l.protections[fnc] {
-				if recv := fnc.Signature().Recv(); recv != nil {
-					lockFunc, unlockFunc := prot.defaultLockUnlockFuncs()
-
-					lockPathWithRecv := append(canonicalPath{recv}, prot.lockPath...)
-					l.currentLockScope().apply(lockPathWithRecv, lockOpOf(lockFunc))
-					l.currentLockScope().applyDeferred(lockPathWithRecv, lockOpOf(unlockFunc))
+				lockFunc, unlockFunc := prot.defaultLockUnlockFuncs()
+				lockPath := prot.lockPath
+				if recv := fnc.Signature().Recv(); recv != nil && prot.withReceiver {
+					lockPath = append(canonicalPath{recv}, lockPath...)
 				}
+
+				l.currentLockScope().apply(lockPath, lockOpOf(lockFunc))
+				l.currentLockScope().applyDeferred(lockPath, lockOpOf(unlockFunc))
 			}
 		}
 
@@ -149,19 +163,16 @@ func (l *lockAnalyzer) analyzeDecl(decl ast.Decl) {
 				}
 			}
 		}
-	case *ast.BadDecl:
-		// Skip
 	}
 }
 
-// TODO handle global vars when we allow protection specs by comments.
 func (l *lockAnalyzer) analyzeStmt(stmt ast.Stmt) {
 	if stmt == nil {
 		return
 	}
 
 	l.enter(stmt)
-	defer l.leave()
+	defer l.exit()
 
 	switch stmt := stmt.(type) {
 	case *ast.DeclStmt:
@@ -255,7 +266,7 @@ func (l *lockAnalyzer) analyzeStmt(stmt ast.Stmt) {
 		l.analyzeExpr(stmt.X)
 		l.leaveAccess()
 		l.analyzeStmt(stmt.Body)
-	case *ast.BadStmt, *ast.EmptyStmt, *ast.BranchStmt:
+	case *ast.EmptyStmt, *ast.BranchStmt:
 		// Skip
 	}
 }
@@ -270,7 +281,7 @@ func (l *lockAnalyzer) enter(nd ast.Node) {
 	l.stack = append(l.stack, nd)
 }
 
-func (l *lockAnalyzer) leave() {
+func (l *lockAnalyzer) exit() {
 	ln := len(l.stack)
 	if ln > 0 {
 		l.stack[ln-1] = nil
@@ -306,11 +317,26 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 	}
 
 	l.enter(expr)
-	defer l.leave()
+	defer l.exit()
 
 	switch expr := expr.(type) {
 	case *ast.Ident:
-		// TODO we might want to add smth here if we support global locks.
+		if obj := l.pass.TypesInfo.ObjectOf(expr); obj != nil {
+			if prots, ok := l.protections[obj]; ok {
+				if missedProts := l.currentLockScope().missedProtections(canonicalPath{obj}, prots, l.currentAccess()); len(missedProts) > 0 {
+					protStr := ""
+					many := false
+					for _, prot := range missedProts {
+						if many {
+							protStr += ", "
+						}
+						protStr += prot.lockObj.Name()
+						many = true
+					}
+					l.pass.Reportf(expr.Pos(), "%s is not held while accessing %s", protStr, obj.Name())
+				}
+			}
+		}
 	case *ast.Ellipsis:
 		l.analyzeExpr(expr.Elt)
 	case *ast.FuncLit:
@@ -342,8 +368,10 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 	case *ast.SelectorExpr:
 		l.analyzeExpr(expr.X)
 
-		xPath := canonicalize(expr.X, l.pass, false)
-		//fmt.Println("Path of", types.ExprString(expr.X), "is", path.String())
+		// Fallback to file imports as TypesInfo.ObjectOf doesn't locate imported PkgName objects.
+		loc := infoLocator(l.pass.TypesInfo).fallback(importsLocator(l.currentFile, l.pass.TypesInfo))
+
+		xPath := loc.canonicalize(expr.X)
 		if xPath == nil {
 			fmt.Println("Unresolvable selector", types.ExprString(expr.X))
 			return
@@ -351,56 +379,58 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 
 		switch obj := l.pass.TypesInfo.ObjectOf(expr.Sel).(type) {
 		case *types.Var:
-			context, _ := typeOf(xPath[len(xPath)-1])
-			_, fieldPath := findFieldWithPath(context, obj.Name())
+			fieldPath := locateFromObjByName(xPath[len(xPath)-1], obj.Name(), false)
 			if fieldPath == nil {
-				fmt.Println("Unresolvable selector:", types.ExprString(expr.Sel))
+				fmt.Println("Unresolvable selector1", types.ExprString(expr.Sel), types.ExprString(expr))
 				return
 			}
 
 			path := xPath
 			for _, comp := range fieldPath {
 				path = append(path, comp)
-				if prots, ok := l.protections[comp]; ok && !l.currentLockScope().isProtected(path, prots, l.currentAccess()) {
-					protStr := ""
-					many := false
-					for _, prot := range l.protections[comp] {
-						if many {
-							protStr += ", "
+				if prots, ok := l.protections[comp]; ok {
+					if missedProts := l.currentLockScope().missedProtections(path, prots, l.currentAccess()); len(missedProts) > 0 {
+						protStr := ""
+						many := false
+						for _, prot := range missedProts {
+							if many {
+								protStr += ", "
+							}
+							protStr += prot.lockObj.Name()
+							many = true
 						}
-						protStr += prot.lockObj.Name()
-						many = true
+						l.pass.Reportf(expr.Pos(), "%s is not held while accessing %s", protStr, comp.Name())
 					}
-					l.pass.Reportf(expr.Pos(), "%s is not held while accessing %s", protStr, comp.Name())
 				}
 			}
 		case *types.Func:
-			context, contextDef := typeOf(xPath[len(xPath)-1])
-			_, funcPath := findFuncWithPath(context, contextDef, obj.Name())
+			funcPath := locateFromObjByName(xPath[len(xPath)-1], obj.Name(), true)
 			if funcPath == nil {
-				fmt.Println("Unresolvable selector:", types.ExprString(expr.Sel), context, contextDef)
+				fmt.Println("Unresolvable selector:", types.ExprString(expr.Sel), types.ExprString(expr))
 				return
 			}
 
 			path := xPath
 			for _, comp := range funcPath {
 				path = append(path, comp)
-				if prots, ok := l.protections[comp]; ok && !l.currentLockScope().isProtected(path, prots, l.currentAccess()) {
-					protStr := ""
-					many := false
-					for _, prot := range l.protections[comp] {
-						if many {
-							protStr += ", "
+				if prots, ok := l.protections[comp]; ok {
+					if missedProts := l.currentLockScope().missedProtections(path, prots, l.currentAccess()); len(missedProts) > 0 {
+						protStr := ""
+						many := false
+						for _, prot := range missedProts {
+							if many {
+								protStr += ", "
+							}
+							protStr += prot.lockObj.Name()
+							many = true
 						}
-						protStr += prot.lockObj.Name()
-						many = true
+						l.pass.Reportf(expr.Pos(), "%s is not held while accessing %s", protStr, comp.Name())
 					}
-					l.pass.Reportf(expr.Pos(), "%s is not held while accessing %s", protStr, comp.Name())
 				}
 			}
 
 			// Check if this is a lock or unlock call.
-			if _, ok := ancestorAs[*ast.CallExpr](l, 1); ok {
+			if _, isCall := ancestorAs[*ast.CallExpr](l, 1); isCall {
 				path := path[:len(path)-1]
 				if op := lockOpOf(obj.Name()); op != noneLockOp && isLockPath(path, op) {
 					scope := l.currentLockScope()

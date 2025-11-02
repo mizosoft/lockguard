@@ -15,16 +15,11 @@ const (
 )
 
 func (kind lockKind) String() string {
-	switch kind {
-	case rwLockKind:
-		return "RWLock"
-	case normalLockKind:
-		return "Lock"
-	case noneLockKind:
-		return "NoneLock"
-	default:
-		panic("unknown lock kind " + strconv.Itoa(int(kind)))
-	}
+	return [...]string{
+		noneLockKind:   "NoneLock",
+		rwLockKind:     "RWLock",
+		normalLockKind: "Lock",
+	}[kind]
 }
 
 func (kind lockKind) isLocking(funcName string) bool {
