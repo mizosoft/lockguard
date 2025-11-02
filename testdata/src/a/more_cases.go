@@ -340,8 +340,7 @@ type valueTest struct {
 }
 
 func (v valueTest) valueReceiver() {
-	v.x++ // Value receiver - copy, so no protection needed?
-	// This is ambiguous - should probably still warn
+	v.x++ // want `mu is not held while accessing x`
 }
 
 func valueReceiverCaller() {

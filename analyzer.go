@@ -148,8 +148,8 @@ func (l *lockAnalyzer) analyzeDecl(decl ast.Decl) {
 					lockPath = append(canonicalPath{recv}, lockPath...)
 				}
 
-				l.currentLockScope().apply(lockPath, lockOpOf(lockFunc))
-				l.currentLockScope().applyDeferred(lockPath, lockOpOf(unlockFunc))
+				l.currentLockScope().apply(copyAppend(lockPath, locateFromObjByName(prot.lockObj(), lockFunc, true)...))
+				l.currentLockScope().applyDeferred(copyAppend(lockPath, locateFromObjByName(prot.lockObj(), unlockFunc, true)...))
 			}
 		}
 
@@ -330,7 +330,7 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 						if many {
 							protStr += ", "
 						}
-						protStr += prot.lockObj.Name()
+						protStr += prot.lockObj().Name()
 						many = true
 					}
 					l.pass.Reportf(expr.Pos(), "%s is not held while accessing %s", protStr, obj.Name())
@@ -396,7 +396,7 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 							if many {
 								protStr += ", "
 							}
-							protStr += prot.lockObj.Name()
+							protStr += prot.lockObj().Name()
 							many = true
 						}
 						l.pass.Reportf(expr.Pos(), "%s is not held while accessing %s", protStr, comp.Name())
@@ -421,7 +421,7 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 							if many {
 								protStr += ", "
 							}
-							protStr += prot.lockObj.Name()
+							protStr += prot.lockObj().Name()
 							many = true
 						}
 						l.pass.Reportf(expr.Pos(), "%s is not held while accessing %s", protStr, comp.Name())
@@ -430,15 +430,12 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 			}
 
 			// Check if this is a lock or unlock call.
-			if _, isCall := ancestorAs[*ast.CallExpr](l, 1); isCall {
-				path := path[:len(path)-1]
-				if op := lockOpOf(obj.Name()); op != noneLockOp && isLockPath(path, op) {
-					scope := l.currentLockScope()
-					if l.isWithinDeferScope() {
-						scope.applyDeferred(path, op)
-					} else {
-						scope.apply(path, op)
-					}
+			if _, isCall := ancestorAs[*ast.CallExpr](l, 1); isCall && isLockOpPath(path) {
+				scope := l.currentLockScope()
+				if l.isWithinDeferScope() {
+					scope.applyDeferred(path)
+				} else {
+					scope.apply(path)
 				}
 			}
 		}

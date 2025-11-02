@@ -60,11 +60,6 @@ func (directive protectionDirective) isSatisfiedBy(kind lockKind, isRead bool, a
 type protection struct {
 	directive protectionDirective
 
-	// The function or variable locating the lock. Note that this is not necessarily the last object located by
-	// the lockExpr. In case of embedded fields, this will be the canonical object on which the Lock/Unlock methods
-	// are defined.
-	lockObj types.Object
-
 	// The path locating the canonical lockObj.
 	lockPath canonicalPath
 
@@ -78,6 +73,10 @@ func (p protection) lockExprString() string {
 
 func (p protection) String() string {
 	return p.lockExprString()
+}
+
+func (p protection) lockObj() types.Object {
+	return p.lockPath[len(p.lockPath)-1]
 }
 
 func (p protection) defaultLockUnlockFuncs() (string, string) {
@@ -352,7 +351,6 @@ func (f *protectionsFinder) findProtection(l locator, directive protectionDirect
 	return protection{
 		directive: directive,
 		lockPath:  lockPath,
-		lockObj:   lockObj,
 	}, nil
 }
 

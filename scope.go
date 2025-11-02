@@ -50,15 +50,10 @@ func lockOpOf(name string) lockOp {
 	return noneLockOp
 }
 
-type deferredOp struct {
-	lockPath canonicalPath
-	op       lockOp
-}
-
 type lockScope struct {
-	tree       lockTree
-	deferredOp []deferredOp
-	pass       *analysis.Pass
+	tree        lockTree
+	deferredOps []canonicalPath
+	pass        *analysis.Pass
 }
 
 func newLockScope(pass *analysis.Pass) *lockScope {
@@ -74,27 +69,26 @@ func newLockScope(pass *analysis.Pass) *lockScope {
 	}
 }
 
-func (s *lockScope) apply(lockPath canonicalPath, op lockOp) {
-	if !isLockPath(lockPath, op) {
+func (s *lockScope) apply(path canonicalPath) {
+	if !isLockOpPath(path) {
 		return
 	}
 
-	switch op {
-	case noneLockOp: // Skip
+	switch op := lockOpOf(path[len(path)-1].Name()); op {
 	case lockLockOp, rLockLockOp:
-		treePath := s.tree.add(lockPath)
-		for i := len(lockPath) - 1; i >= 0; i-- {
+		treePath := s.tree.add(path)
+		for i := len(path) - 2; i >= 0; i-- {
 			// Check if the locking/unlocking function is defined (directly or indirectly through embedded fields) by
 			// this object.
-			pathFromObj := locateFromObjByName(lockPath[i], op.funcName(), true)
+			pathFromObj := locateFromObjByName(path[i], op.funcName(), true)
 			if pathFromObj == nil {
 				return
 			}
-			if !slices.Equal(lockPath[i+1:], pathFromObj[:len(pathFromObj)-1]) {
+			if !slices.Equal(path[i+1:], pathFromObj) {
 				return // Op is not transferable.
 			}
 
-			kind := lockKindOfObject(lockPath[i])
+			kind := lockKindOfObject(path[i])
 			if kind == noneLockKind {
 				continue
 			}
@@ -107,7 +101,7 @@ func (s *lockScope) apply(lockPath canonicalPath, op lockOp) {
 			}
 
 			// Break if lock state is not transferable upwards.
-			switch obj := lockPath[i].(type) {
+			switch obj := path[i].(type) {
 			case *types.Var:
 				if !obj.Embedded() {
 					return
@@ -117,24 +111,24 @@ func (s *lockScope) apply(lockPath canonicalPath, op lockOp) {
 			}
 		}
 	case unlockLockOp, rUnlockLockOp:
-		treePath := s.tree.follow(lockPath)
+		treePath := s.tree.follow(path)
 		if len(treePath) == 0 {
 			// TODO warn about unlocking a non-locked lock.
 			return
 		}
 
-		for i := len(lockPath) - 1; i >= 0; i-- {
+		for i := len(path) - 2; i >= 0; i-- {
 			// Check if the locking/unlocking function is defined (directly or indirectly through embedded fields) by
 			// this object's type.
-			pathFromObj := locateFromObjByName(lockPath[i], op.funcName(), true)
+			pathFromObj := locateFromObjByName(path[i], op.funcName(), true)
 			if pathFromObj == nil {
 				return
 			}
-			if !slices.Equal(lockPath[i+1:], pathFromObj[:len(pathFromObj)-1]) {
+			if !slices.Equal(path[i+1:], pathFromObj) {
 				return // Op is not transferable.
 			}
 
-			kind := lockKindOfObject(lockPath[i])
+			kind := lockKindOfObject(path[i])
 			if kind == noneLockKind {
 				continue
 			}
@@ -147,7 +141,7 @@ func (s *lockScope) apply(lockPath canonicalPath, op lockOp) {
 			}
 
 			// Break if lock state is not transferable upwards.
-			switch obj := lockPath[i].(type) {
+			switch obj := path[i].(type) {
 			case *types.Var:
 				if !obj.Embedded() {
 					return
@@ -156,22 +150,24 @@ func (s *lockScope) apply(lockPath canonicalPath, op lockOp) {
 				return
 			}
 		}
+	case noneLockOp:
+		panic("should've been checked by isLockOpPath to not be the case")
 	}
 	return
 }
 
-func (s *lockScope) applyDeferred(lockPath canonicalPath, unlockOp lockOp) {
-	if !isLockPath(lockPath, unlockOp) {
+func (s *lockScope) applyDeferred(path canonicalPath) {
+	if !isLockOpPath(path) {
 		return
 	}
-	s.deferredOp = append(s.deferredOp, deferredOp{lockPath, unlockOp})
+	s.deferredOps = append(s.deferredOps, path)
 }
 
 func (s *lockScope) flushDeferred() {
-	for _, entry := range s.deferredOp {
-		s.apply(entry.lockPath, entry.op)
+	for _, path := range s.deferredOps {
+		s.apply(path)
 	}
-	s.deferredOp = nil
+	s.deferredOps = nil
 }
 
 func (s *lockScope) missedProtections(objectPath canonicalPath, prots []protection, access accessKind) []protection {
@@ -203,20 +199,29 @@ func (s *lockScope) missedProtections(objectPath canonicalPath, prots []protecti
 	return missedProts
 }
 
-func isLockPath(lockPath canonicalPath, op lockOp) bool {
-	if len(lockPath) == 0 {
+func isLockOpPath(path canonicalPath) bool {
+	if len(path) <= 1 {
+		return false
+	}
+
+	if _, isFunc := path[len(path)-1].(*types.Func); !isFunc {
+		return false
+	}
+
+	op := lockOpOf(path[len(path)-1].Name())
+	if op == noneLockOp {
 		return false
 	}
 
 	// Check there's at least one Lock or RLock node from the end and that op is transferable through the
-	// remaining suffix.
-	for i := len(lockPath) - 1; i >= 0; i-- {
-		pathToOp := locateFromObjByName(lockPath[len(lockPath)-1], op.funcName(), true)
-		if !slices.Equal(lockPath[i+1:], pathToOp[:len(pathToOp)-1]) {
+	// remaining suffix to that node.
+	for i := len(path) - 2; i >= 0; i-- {
+		pathToOp := locateFromObjByName(path[i], op.funcName(), true)
+		if !slices.Equal(path[i+1:], pathToOp) {
 			return false
 		}
 
-		kind := lockKindOfObject(lockPath[i])
+		kind := lockKindOfObject(path[i])
 		if kind != noneLockKind && (kind == rwLockKind || (op != rLockLockOp && op != rUnlockLockOp)) {
 			return true
 		}
