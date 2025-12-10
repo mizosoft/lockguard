@@ -4,8 +4,9 @@ import (
 	"fmt"
 	"go/types"
 	"slices"
+	"strings"
 
-	"golang.org/x/tools/go/analysis"
+	"golang.org/x/tools/go/cfg"
 )
 
 type lockOp int
@@ -17,8 +18,6 @@ const (
 	rLockLockOp
 	rUnlockLockOp
 )
-
-var lockOps = []lockOp{lockLockOp, unlockLockOp, rLockLockOp, rUnlockLockOp}
 
 func (o lockOp) funcName() string {
 	return [...]string{
@@ -35,7 +34,7 @@ func (o lockOp) String() string {
 }
 
 func lockOpOf(name string) lockOp {
-	for _, op := range lockOps {
+	for _, op := range []lockOp{lockLockOp, unlockLockOp, rLockLockOp, rUnlockLockOp} {
 		if name == op.funcName() {
 			return op
 		}
@@ -43,32 +42,36 @@ func lockOpOf(name string) lockOp {
 	return noneLockOp
 }
 
-type lockScope struct {
-	tree        lockTree
-	deferredOps []canonicalPath
-	pass        *analysis.Pass
+type deferredOp struct {
+	block *cfg.Block
+	path  canonicalPath
 }
 
-func newLockScope(pass *analysis.Pass) *lockScope {
+type lockScope struct {
+	trees       map[*cfg.Block]lockTree // Map's from CFG block IDs to the corresponding lockTree identifying lock states.
+	deferredOps []deferredOp
+}
+
+func newLockScope() *lockScope {
 	return &lockScope{
-		tree: lockTree{
-			node: node{
-				children: make(map[types.Object]*node),
-				obj:      nil, // nil identifies root (global scope).
-			},
-		},
-		pass: pass,
+		trees: make(map[*cfg.Block]lockTree),
 	}
 }
 
-func (s *lockScope) apply(path canonicalPath) (warnings []string) {
+func (s *lockScope) apply(block *cfg.Block, path canonicalPath) (warnings []string) {
 	if !isLockOpPath(path) {
 		return
 	}
 
+	tree, ok := s.trees[block]
 	switch op := lockOpOf(path[len(path)-1].Name()); op {
 	case lockLockOp, rLockLockOp:
-		treePath := s.tree.add(path[:len(path)-1])
+		if !ok {
+			tree = lockTree{newNode(nil)}
+			s.trees[block] = tree
+		}
+
+		treePath := tree.add(path[:len(path)-1])
 		for i := len(path) - 2; i >= 0; i-- {
 			// Check if the locking/unlocking function is defined (directly or indirectly through embedded fields) by
 			// this object.
@@ -87,17 +90,21 @@ func (s *lockScope) apply(path canonicalPath) (warnings []string) {
 
 			nd := treePath[i]
 			if op == lockLockOp && (kind == normalLockKind || kind == rwLockKind) {
-				if nd.lockCount >= 1 {
+				if nd.certainLockCount >= 1 || nd.certainRLockCount >= 1 {
 					warnings = append(warnings, fmt.Sprintf("deadlock: %v - already locked", nd.obj.Name()))
-				} else if nd.rLockCount >= 1 {
-					warnings = append(warnings, fmt.Sprintf("deadlock: %v - already read-locked", nd.obj.Name()))
+				} else if nd.possibleLockCount >= 1 || nd.possibleRLockCount >= 1 {
+					warnings = append(warnings, fmt.Sprintf("deadlock: %v - possibly already locked", nd.obj.Name()))
 				}
-				nd.lockCount++
+				nd.certainLockCount++
+				nd.possibleLockCount++
 			} else if kind == rwLockKind { // op is rLockLockOp
-				if nd.lockCount >= 1 {
+				if nd.certainLockCount >= 1 {
 					warnings = append(warnings, fmt.Sprintf("deadlock: %v - already locked", nd.obj.Name()))
+				} else if nd.possibleLockCount >= 1 {
+					warnings = append(warnings, fmt.Sprintf("deadlock: %v - possibly already locked", nd.obj.Name()))
 				}
-				nd.rLockCount++
+				nd.certainRLockCount++
+				nd.possibleRLockCount++
 			}
 
 			// Break if lock state is not transferable upwards.
@@ -106,17 +113,21 @@ func (s *lockScope) apply(path canonicalPath) (warnings []string) {
 				if !obj.Embedded() {
 					return
 				}
-			case *types.Func, *types.PkgName:
+			default:
 				return
 			}
 		}
 	case unlockLockOp, rUnlockLockOp:
-		treePath := s.tree.follow(path[:len(path)-1])
+		var treePath []*node
+		if ok {
+			treePath = tree.follow(path[:len(path)-1])
+		}
+
 		if len(treePath) == 0 {
 			if op == unlockLockOp {
 				warnings = append(warnings, fmt.Sprintf("%v - unlocking a non-locked lock", path[len(path)-2].Name()))
 			} else {
-				warnings = append(warnings, fmt.Sprintf("%v - read-unlocking a non-read-locked lock", path[len(path)-2].Name()))
+				warnings = append(warnings, fmt.Sprintf("%v - read-unlocking a non-locked lock", path[len(path)-2].Name()))
 			}
 			return
 		}
@@ -139,15 +150,27 @@ func (s *lockScope) apply(path canonicalPath) (warnings []string) {
 
 			nd := treePath[i]
 			if op == unlockLockOp {
-				if nd.lockCount <= 0 {
-					warnings = append(warnings, fmt.Sprintf("%v - unlocking a non-locked lock", nd.obj.Name()))
+				if nd.certainLockCount <= 0 {
+					if nd.possibleLockCount > 0 {
+						warnings = append(warnings, fmt.Sprintf("%v - unlocking a possibly non-locked lock", nd.obj.Name()))
+						nd.possibleLockCount--
+					} else {
+						warnings = append(warnings, fmt.Sprintf("%v - unlocking a non-locked lock", nd.obj.Name()))
+					}
 				} else {
-					nd.lockCount--
+					nd.certainLockCount--
+					nd.possibleLockCount--
 				}
-			} else if nd.rLockCount <= 0 {
-				warnings = append(warnings, fmt.Sprintf("%v - read-unlocking a non-read-locked lock", nd.obj.Name()))
+			} else if nd.certainRLockCount <= 0 {
+				if nd.possibleRLockCount > 0 {
+					warnings = append(warnings, fmt.Sprintf("%v - read-unlocking a possibly non-locked lock", nd.obj.Name()))
+					nd.possibleRLockCount--
+				} else {
+					warnings = append(warnings, fmt.Sprintf("%v - read-unlocking a non-locked lock", nd.obj.Name()))
+				}
 			} else {
-				nd.rLockCount--
+				nd.certainRLockCount--
+				nd.possibleRLockCount--
 			}
 
 			// Break if lock state is not transferable upwards.
@@ -156,7 +179,7 @@ func (s *lockScope) apply(path canonicalPath) (warnings []string) {
 				if !obj.Embedded() {
 					return
 				}
-			case *types.Func, *types.PkgName:
+			default:
 				return
 			}
 		}
@@ -166,41 +189,71 @@ func (s *lockScope) apply(path canonicalPath) (warnings []string) {
 	return
 }
 
-func (s *lockScope) applyDeferred(path canonicalPath) {
+func (s *lockScope) merge(src *cfg.Block, dst *cfg.Block) {
+	srcTree := s.trees[src]
+	if srcTree.root == nil {
+		s.trees[dst] = lockTree{newNode(nil)} // Create an empty tree with no lock info.
+	} else if dstTree, ok := s.trees[dst]; ok {
+		// If there is a dstTree, merge the tree.
+		dstTree.root.mergeFrom(srcTree.root)
+	} else {
+		// Otherwise, copy the tree.
+		s.trees[dst] = lockTree{srcTree.root.copy()}
+	}
+}
+
+func (s *lockScope) applyDeferred(entry *cfg.Block, path canonicalPath) {
 	if !isLockOpPath(path) {
 		return
 	}
-	s.deferredOps = append(s.deferredOps, path)
+	s.deferredOps = append(s.deferredOps, deferredOp{entry, path})
 }
 
 func (s *lockScope) flushDeferred() {
-	for _, path := range s.deferredOps {
-		s.apply(path)
+	for _, entry := range s.deferredOps {
+		s.apply(entry.block, entry.path)
 	}
 	s.deferredOps = nil
 }
 
-func (s *lockScope) missedProtections(objectPath canonicalPath, prots []protection, access accessKind) []protection {
+func (s *lockScope) checkProtections(source *cfg.Block, objectPath canonicalPath, prots []protection, access accessKind) (warnings []string) {
 	if len(objectPath) == 0 {
 		return nil // Vacuously
 	}
 
+	tree, ok := s.trees[source]
+	if !ok {
+		return []string{fmt.Sprintf("%s is not held while accessing %s", strings.Join(getLockVariables(prots), ", "), objectPath[len(objectPath)-1].Name())}
+	}
+
 	var missedProts []protection
+	var possiblyMissedProts []protection
 	for _, prot := range prots {
 		lockPath := copyAppend(objectPath[:len(objectPath)-1], prot.lockPath...)
-		treePath := s.tree.follow(lockPath)
+		treePath := tree.follow(lockPath)
 		if len(lockPath) != len(treePath) {
 			missedProts = append(missedProts, prot)
-			continue
-		}
-
-		nd := treePath[len(treePath)-1]
-		if (nd.lockCount == 0 && nd.rLockCount == 0) || !prot.directive.isSatisfiedBy(lockKindOfObject(nd.obj), nd.lockCount == 0, access) {
+		} else if nd := treePath[len(treePath)-1]; (nd.possibleLockCount <= 0 && nd.possibleRLockCount <= 0) || !prot.directive.isSatisfiedBy(lockKindOfObject(nd.obj), nd.possibleLockCount == 0, access) {
 			missedProts = append(missedProts, prot)
-			continue
+		} else if (nd.certainLockCount <= 0 && nd.certainRLockCount <= 0) || !prot.directive.isSatisfiedBy(lockKindOfObject(nd.obj), nd.certainLockCount == 0, access) {
+			possiblyMissedProts = append(possiblyMissedProts, prot)
 		}
 	}
-	return missedProts
+
+	if len(missedProts) > 0 {
+		warnings = append(warnings, fmt.Sprintf("%s is not held while accessing %s", strings.Join(getLockVariables(missedProts), ", "), objectPath[len(objectPath)-1].Name()))
+	}
+	if len(possiblyMissedProts) > 0 {
+		warnings = append(warnings, fmt.Sprintf("%s is possibly not held while accessing %s", strings.Join(getLockVariables(possiblyMissedProts), ", "), objectPath[len(objectPath)-1].Name()))
+	}
+	return
+}
+
+func getLockVariables(prots []protection) (vars []string) {
+	for _, prot := range prots {
+		vars = append(vars, prot.lockObj().Name())
+	}
+	return
 }
 
 func isLockOpPath(path canonicalPath) bool {
@@ -234,11 +287,11 @@ func isLockOpPath(path canonicalPath) bool {
 }
 
 type lockTree struct {
-	node
+	root *node
 }
 
-func (t *lockTree) add(path canonicalPath) []*node {
-	curr := &t.node
+func (t lockTree) add(path canonicalPath) []*node {
+	curr := t.root
 	var treePath []*node
 	for _, obj := range path {
 		if next, ok := curr.children[obj]; ok {
@@ -256,8 +309,8 @@ func (t *lockTree) add(path canonicalPath) []*node {
 	return treePath
 }
 
-func (t *lockTree) follow(path canonicalPath) []*node {
-	curr := &t.node
+func (t lockTree) follow(path canonicalPath) []*node {
+	curr := t.root
 	var treePath []*node
 	for _, obj := range path {
 		if next, ok := curr.children[obj]; ok {
@@ -270,9 +323,69 @@ func (t *lockTree) follow(path canonicalPath) []*node {
 	return treePath
 }
 
+func (t lockTree) print() {
+	q := make([]*node, 0)
+	if t.root != nil {
+		q = append(q, t.root)
+	}
+
+	for len(q) > 0 {
+		n := q[0]
+		q = q[1:]
+
+		fmt.Printf("%v - <%d, %d, %d, %d>\n", n.obj, n.certainLockCount, n.certainRLockCount, n.possibleLockCount, n.possibleRLockCount)
+		for obj, c := range n.children {
+			fmt.Printf("%v -> %v\n", n.obj, obj)
+			q = append(q, c)
+		}
+		fmt.Println()
+	}
+}
+
+func (s *lockScope) print(block *cfg.Block) {
+	s.trees[block].print()
+	fmt.Println()
+}
+
 type node struct {
-	children   map[types.Object]*node
-	obj        types.Object // Node object, nil for root.
-	lockCount  int          // Typically either 0 or 1. Warnings are emitted if it gets above 1.
-	rLockCount int
+	children                              map[types.Object]*node
+	obj                                   types.Object // Node object, nil for root.
+	certainLockCount, certainRLockCount   int
+	possibleLockCount, possibleRLockCount int
+}
+
+func newNode(obj types.Object) *node {
+	return &node{
+		children: make(map[types.Object]*node),
+		obj:      obj,
+	}
+}
+
+func (n *node) copy() *node {
+	dst := newNode(n.obj)
+	dst.certainLockCount, dst.certainRLockCount, dst.possibleLockCount, dst.possibleRLockCount =
+		n.certainLockCount, n.certainRLockCount, n.possibleLockCount, n.possibleRLockCount
+	for obj, child := range n.children {
+		dst.children[obj] = child.copy()
+	}
+	return dst
+}
+
+func (n *node) mergeFrom(src *node) {
+	if n.obj != src.obj {
+		panic("merging nodes of different objects")
+	}
+
+	n.certainLockCount, n.certainRLockCount = min(n.certainLockCount, src.certainLockCount), min(n.certainRLockCount, src.certainRLockCount)
+	n.possibleLockCount, n.possibleRLockCount = max(n.possibleLockCount, src.possibleLockCount), max(n.possibleRLockCount, src.possibleRLockCount)
+
+	for obj, srcChild := range src.children {
+		if dstChild, ok := n.children[obj]; ok {
+			dstChild.mergeFrom(srcChild)
+		} else {
+			dstChild = newNode(srcChild.obj)
+			dstChild.mergeFrom(srcChild)
+			n.children[obj] = dstChild
+		}
+	}
 }

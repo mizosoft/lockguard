@@ -2,21 +2,21 @@ package a
 
 import (
 	"fmt"
-	sync "sync"
+	"sync"
 )
 
-type SBasic struct {
+type S1 struct {
 	i   int `protected_by:"mut"`
 	j   int
 	mut sync.Mutex
 }
 
-func (s *SBasic) mutFunc() *sync.Mutex {
+func (s *S1) mutFunc() *sync.Mutex {
 	return &s.mut
 }
 
 func lockUnlock() {
-	var s1 SBasic
+	var s1 S1
 	s1.i++ // want `mut is not held while accessing i`
 
 	s1.mut.Lock()
@@ -26,7 +26,7 @@ func lockUnlock() {
 	s1.i++ // want `mut is not held while accessing i`
 }
 
-func (s *SBasic) methodLockUnlock() {
+func (s *S1) methodLockUnlock() {
 	s.i++ // want `mut is not held while accessing i`
 
 	s.mut.Lock()
@@ -37,7 +37,7 @@ func (s *SBasic) methodLockUnlock() {
 }
 
 func lockDeferredUnlock() {
-	var s1 SBasic
+	var s1 S1
 	s1.i++ // want `mut is not held while accessing i`
 
 	s1.mut.Lock()
@@ -45,7 +45,7 @@ func lockDeferredUnlock() {
 	s1.i++
 }
 
-func (s *SBasic) methodLockUnlockDeferred() {
+func (s *S1) methodLockUnlockDeferred() {
 	s.i++ // want `mut is not held while accessing i`
 
 	s.mut.Lock()
@@ -54,16 +54,16 @@ func (s *SBasic) methodLockUnlockDeferred() {
 }
 
 func accessNonProtectedField() {
-	var s1 SBasic
+	var s1 S1
 	s1.j++
 }
 
-func (s *SBasic) methodAccessNonProtectedFields() {
+func (s *S1) methodAccessNonProtectedFields() {
 	s.j++
 }
 
 func funcLiteralAcquiresNewScope() {
-	var s1 SBasic
+	var s1 S1
 	s1.mut.Lock()
 	fn := func() {
 		s1.i++ // want `mut is not held while accessing i`
@@ -76,7 +76,7 @@ func funcLiteralAcquiresNewScope() {
 	fmt.Println(fn) // Consume
 }
 
-func (s *SBasic) methodFuncLiteralAcquiresNewScope() {
+func (s *S1) methodFuncLiteralAcquiresNewScope() {
 	s.mut.Lock()
 	fn := func() {
 		s.i++ // want `mut is not held while accessing i`
@@ -90,7 +90,7 @@ func (s *SBasic) methodFuncLiteralAcquiresNewScope() {
 }
 
 func funcLiteralInCallMaintainsScope() {
-	var s1 SBasic
+	var s1 S1
 	s1.mut.Lock()
 	func() {
 		s1.i++ // Inline functions retain current lock scope
@@ -98,7 +98,7 @@ func funcLiteralInCallMaintainsScope() {
 	s1.mut.Unlock()
 }
 
-func (s *SBasic) funcLiteralInCallMaintainsScope() {
+func (s *S1) funcLiteralInCallMaintainsScope() {
 	s.mut.Lock()
 	func() {
 		s.i++ // Inline functions retain current lock scope
@@ -107,11 +107,11 @@ func (s *SBasic) funcLiteralInCallMaintainsScope() {
 }
 
 type S2 struct {
-	s1 SBasic
+	s1 S1
 	k  int `protected_by:"s1.mut"`
 }
 
-func (s *S2) s1Func() *SBasic {
+func (s *S2) s1Func() *S1 {
 	return &s.s1
 }
 
@@ -167,18 +167,23 @@ func lockUnlockWithScopes() {
 			switch 1 {
 			case 1:
 				if 1 < 2 {
-					for {
-						if s2.s1.i > 0 { // want `mut is not held while accessing i`
-						} else if s2.k > 0 { // want `mut is not held while accessing k`
+					for s2.s1.i > 0 { // want `mut is not held while accessing i`
+						if s2.s1.i == 5 { // want `mut is not held while accessing i`
+						} else if s2.k > 1 { // want `mut is not held while accessing k`
 						}
 					}
 
 					s2.s1.mut.Lock()
-					for {
+					for s2.s1.i <= 10 {
 						switch 1 {
 						case 1:
 							s2.s1.i++
 							s2.k++
+
+							{
+								s2.s1.i++
+								s2.k++
+							}
 
 							// This function will retain lock scope as it is called inline.
 							func() {
@@ -194,6 +199,7 @@ func lockUnlockWithScopes() {
 										s2.s1.mut.Lock()
 										defer s2.s1.mut.Unlock()
 
+										// This function doesn't lose lock scope.
 										func() {
 											s2.s1.i++
 											s2.k++
@@ -202,7 +208,6 @@ func lockUnlockWithScopes() {
 									fmt.Println(fn2)
 								}
 								fmt.Println(fn)
-
 							}()
 						}
 					}
@@ -224,14 +229,15 @@ func (s *S2) methodLockUnlockWithScopes() {
 			switch 1 {
 			case 1:
 				if 1 < 2 {
-					for {
+					for s.k <= 10 { // want `mut is not held while accessing k`
 						if s.s1.i > 0 { // want `mut is not held while accessing i`
 						} else if s.k > 0 { // want `mut is not held while accessing k`
+							s.k++ // want `mut is not held while accessing k`
 						}
 					}
 
 					s.s1.mut.Lock()
-					for {
+					for s.s1.i <= 10 {
 						switch 1 {
 						case 1:
 							s.s1.i++
@@ -251,10 +257,10 @@ func (s *S2) methodLockUnlockWithScopes() {
 }
 
 //lockguard:protected_by s.mut
-func (s *SBasic) f1() {}
+func (s *S1) f1() {}
 
 func funcLockUnlock() {
-	var s1 SBasic
+	var s1 S1
 	s1.f1() // want `mut is not held while accessing f`
 
 	s1.mut.Lock()
@@ -264,7 +270,7 @@ func funcLockUnlock() {
 	s1.f1() // want `mut is not held while accessing f`
 }
 
-func (s *SBasic) methodFuncLockUnlock() {
+func (s *S1) methodFuncLockUnlock() {
 	s.f1() // want `mut is not held while accessing f`
 
 	s.mut.Lock()
@@ -275,7 +281,7 @@ func (s *SBasic) methodFuncLockUnlock() {
 }
 
 func funcLockDeferredUnlock() {
-	var s1 SBasic
+	var s1 S1
 	s1.f1() // want `mut is not held while accessing f`
 
 	s1.mut.Lock()
@@ -283,7 +289,7 @@ func funcLockDeferredUnlock() {
 	s1.f1()
 }
 
-func (s *SBasic) methodFuncLockUnlockDeferred() {
+func (s *S1) methodFuncLockUnlockDeferred() {
 	s.f1() // want `mut is not held while accessing f`
 
 	s.mut.Lock()
@@ -292,7 +298,7 @@ func (s *SBasic) methodFuncLockUnlockDeferred() {
 }
 
 //lockguard:protected_by s.mut
-func (s *SBasic) f2() {
+func (s *S1) f2() {
 	// We can call fields protected by s.mut
 	s.i++
 	s.f1()
@@ -308,7 +314,7 @@ func (s *S2) f2() {
 	s.k++
 }
 
-func (s *SBasic) parenthesizedExpr() {
+func (s *S1) parenthesizedExpr() {
 	((s).mut).Lock()
 	defer ((s).mut).Unlock()
 
@@ -415,5 +421,3 @@ func (s *S9) hiddenProtectedField() {
 	s.Unlock()
 	s.mu.Unlock()
 }
-
-// TODO S1{}.i

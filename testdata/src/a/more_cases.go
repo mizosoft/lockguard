@@ -23,9 +23,9 @@ func (c *controlFlow) lockInBranch(cond bool) {
 	if cond {
 		c.mu.Lock()
 	}
-	c.x++ // want `mu is not held while accessing x`
+	c.x++ // want `mu is possibly not held while accessing x`
 	if cond {
-		c.mu.Unlock()
+		c.mu.Unlock() // want `unlocking a possibly non-locked lock`
 	}
 }
 

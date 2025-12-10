@@ -1,15 +1,15 @@
 package lockgaurd
 
 import (
-	"fmt"
 	"go/ast"
 	"go/token"
 	"go/types"
-	"strings"
+	"log"
 
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/inspect"
 	"golang.org/x/tools/go/ast/inspector"
+	"golang.org/x/tools/go/cfg"
 )
 
 // TODO handle struct literals.
@@ -74,16 +74,42 @@ type lockAnalyzer struct {
 	pass        *analysis.Pass
 	cursor      inspector.Cursor
 	currentFile *ast.File
+	blocks      []*cfg.Block
+}
+
+func (l *lockAnalyzer) currentBlock() *cfg.Block {
+	if len(l.blocks) == 0 {
+		return nil
+	}
+	return l.blocks[len(l.blocks)-1]
+}
+
+func (l *lockAnalyzer) currentNode() ast.Node {
+	if len(l.stack) == 0 {
+		return nil
+	}
+	return l.stack[len(l.stack)-1]
+}
+
+func (l *lockAnalyzer) enterBlock(block *cfg.Block) {
+	l.blocks = append(l.blocks, block)
+	log.Printf("Entering CFG block: <%v>\n", block)
+	l.currentLockScope().print(block)
+}
+
+func (l *lockAnalyzer) exitBlock() {
+	block := l.currentBlock()
+	log.Printf("Exiting CFG block: <%v>\n", block)
+	l.currentLockScope().print(block)
+	l.blocks = l.blocks[:len(l.blocks)-1]
 }
 
 func (l *lockAnalyzer) enterLockScope() {
-	l.lockScopes = append(l.lockScopes, newLockScope(l.pass))
+	l.lockScopes = append(l.lockScopes, newLockScope())
 }
 
 func (l *lockAnalyzer) exitLockScope() {
-	// TODO warn about unlocked locks.
 	ln := len(l.lockScopes)
-	l.lockScopes[ln-1].flushDeferred()
 	l.lockScopes[ln-1] = nil
 	l.lockScopes = l.lockScopes[0 : ln-1]
 }
@@ -127,10 +153,34 @@ func (l *lockAnalyzer) analyzeDecl(decl ast.Decl) {
 	switch decl := decl.(type) {
 	case *ast.FuncDecl:
 		l.enterLockScope()
+		l.analyzeCfg(decl.Body, nil)
+		l.exitLockScope()
+	case *ast.GenDecl:
+		if decl.Tok == token.VAR {
+			for _, spec := range decl.Specs {
+				if valueSpec, isValueSpec := spec.(*ast.ValueSpec); isValueSpec {
+					l.analyzeExprs(valueSpec.Values)
+				}
+			}
+		}
+	}
+}
 
-		// If this function is protected by a lock, we'll assume this lock is held while analyzing it. This allows other
-		// functions/variables protected by the same lock to be called within this function.
-		if fnc, ok := l.pass.TypesInfo.ObjectOf(decl.Name).(*types.Func); ok {
+func (l *lockAnalyzer) analyzeCfg(block *ast.BlockStmt, entry *cfg.Block) {
+	g := cfg.New(block, func(expr *ast.CallExpr) bool {
+		return true
+	})
+
+	log.Println("Generated CFG block", "\n`", g.Format(l.pass.Fset), "`")
+
+	if entry != nil {
+		l.currentLockScope().merge(entry, g.Blocks[0])
+	}
+
+	// If this block belongs to a function, and the function has protections, we'll assume these protections are held while
+	// analyzing it. This allows other functions/variables which have the same protections to be called within this function.
+	if funcDecl, ok := l.currentNode().(*ast.FuncDecl); ok {
+		if fnc, ok := l.pass.TypesInfo.ObjectOf(funcDecl.Name).(*types.Func); ok {
 			for _, prot := range l.protections[fnc] {
 				lockFunc, unlockFunc := prot.defaultLockUnlockFuncs()
 				lockPath := prot.lockPath
@@ -138,18 +188,49 @@ func (l *lockAnalyzer) analyzeDecl(decl ast.Decl) {
 					lockPath = append(canonicalPath{recv}, lockPath...)
 				}
 
-				l.currentLockScope().apply(copyAppend(lockPath, locateFromObjByName(prot.lockObj(), lockFunc)...))
-				l.currentLockScope().applyDeferred(copyAppend(lockPath, locateFromObjByName(prot.lockObj(), unlockFunc)...))
+				l.currentLockScope().apply(g.Blocks[0], copyAppend(lockPath, locateFromObjByName(prot.lockObj(), lockFunc)...))
+				l.currentLockScope().applyDeferred(g.Blocks[0], copyAppend(lockPath, locateFromObjByName(prot.lockObj(), unlockFunc)...))
 			}
 		}
+	}
 
-		l.analyzeStmt(decl.Body)
-		l.exitLockScope()
-	case *ast.GenDecl:
-		if decl.Tok == token.VAR {
-			for _, spec := range decl.Specs {
-				if valueSpec, isValueSpec := spec.(*ast.ValueSpec); isValueSpec {
-					l.analyzeExprs(valueSpec.Values)
+	used := make(map[int32]bool)
+
+	for _, block := range g.Blocks {
+		if !block.Live {
+			continue
+		}
+
+		if _, ok := used[block.Index]; ok {
+			continue
+		}
+
+		used[block.Index] = true
+		q := []*cfg.Block{block}
+		for len(q) > 0 {
+			b := q[0]
+			q = q[1:]
+
+			l.enterBlock(b)
+			for _, nd := range b.Nodes {
+				switch nd := nd.(type) {
+				case ast.Stmt:
+					l.analyzeStmt(nd)
+				case ast.Expr:
+					l.analyzeExpr(nd)
+				case *ast.ValueSpec:
+					l.analyzeExprs(nd.Values)
+				}
+			}
+			l.exitBlock()
+
+			// TODO handle back edges in case of loops. We can make the algorithm proceed to visit it one more time. That
+			//      way things like for { mut.Lock() } will be caught.
+			for _, succ := range b.Succs {
+				l.currentLockScope().merge(b, succ)
+				if _, ok := used[succ.Index]; !ok { // First time to visit.
+					q = append(q, succ)
+					used[succ.Index] = true
 				}
 			}
 		}
@@ -206,9 +287,7 @@ func (l *lockAnalyzer) analyzeStmt(stmt ast.Stmt) {
 		l.analyzeExprs(stmt.Results)
 		l.leaveAccess()
 	case *ast.BlockStmt:
-		for _, stmt := range stmt.List {
-			l.analyzeStmt(stmt)
-		}
+		l.analyzeCfg(stmt, l.currentBlock())
 	case *ast.IfStmt:
 		l.analyzeStmt(stmt.Init)
 		l.enterAccess(readAccessKind)
@@ -291,7 +370,7 @@ func (l *lockAnalyzer) isWithinDeferScope() bool {
 		case *ast.FuncDecl:
 			return false
 		case *ast.FuncLit:
-			// This check makes defer func(){ s.mut.Unlock() }() work.
+			// This check makes expressions like defer func(){ s.mut.Unlock() }() work.
 			if _, ok := ancestorAs[*ast.CallExpr](l, len(l.stack)-i); ok {
 				return true
 			}
@@ -313,17 +392,8 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 	case *ast.Ident:
 		if obj := l.pass.TypesInfo.ObjectOf(expr); obj != nil {
 			if prots, ok := l.protections[obj]; ok {
-				if missedProts := l.currentLockScope().missedProtections(canonicalPath{obj}, prots, l.currentAccess()); len(missedProts) > 0 {
-					protStr := ""
-					many := false
-					for _, prot := range missedProts {
-						if many {
-							protStr += ", "
-						}
-						protStr += prot.lockObj().Name()
-						many = true
-					}
-					l.pass.Reportf(expr.Pos(), "%s is not held while accessing %s", protStr, obj.Name())
+				for _, warning := range l.currentLockScope().checkProtections(l.currentBlock(), canonicalPath{obj}, prots, l.currentAccess()) {
+					l.pass.Reportf(expr.Pos(), "%s", warning)
 				}
 			}
 		}
@@ -344,7 +414,11 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 			l.enterLockScope()
 		}
 
-		l.analyzeStmt(expr.Body)
+		if retainLockScope {
+			l.analyzeCfg(expr.Body, l.currentBlock()) // Follow up with current flow.
+		} else {
+			l.analyzeCfg(expr.Body, nil)
+		}
 
 		if !retainLockScope {
 			l.exitLockScope()
@@ -362,7 +436,7 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 
 		xPath := loc.canonicalize(expr.X)
 		if xPath == nil {
-			fmt.Println("Unresolvable selector", types.ExprString(expr.X))
+			log.Println("Unresolvable selector", types.ExprString(expr.X))
 			return
 		}
 
@@ -370,7 +444,7 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 		case *types.Var:
 			fieldPath := locateFromObjByName(xPath[len(xPath)-1], obj.Name())
 			if fieldPath == nil {
-				fmt.Println("Unresolvable selector1", types.ExprString(expr.Sel), types.ExprString(expr))
+				log.Println("Unresolvable selector1", types.ExprString(expr.Sel), types.ExprString(expr))
 				return
 			}
 
@@ -378,24 +452,15 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 			for _, comp := range fieldPath {
 				path = append(path, comp)
 				if prots, ok := l.protections[comp]; ok {
-					if missedProts := l.currentLockScope().missedProtections(path, prots, l.currentAccess()); len(missedProts) > 0 {
-						protStr := ""
-						many := false
-						for _, prot := range missedProts {
-							if many {
-								protStr += ", "
-							}
-							protStr += prot.lockObj().Name()
-							many = true
-						}
-						l.pass.Reportf(expr.Pos(), "%s is not held while accessing %s", protStr, comp.Name())
+					for _, warning := range l.currentLockScope().checkProtections(l.currentBlock(), path, prots, l.currentAccess()) {
+						l.pass.Reportf(expr.Pos(), "%s", warning)
 					}
 				}
 			}
 		case *types.Func:
 			funcPath := locateFromObjByName(xPath[len(xPath)-1], obj.Name())
 			if funcPath == nil {
-				fmt.Println("Unresolvable selector:", types.ExprString(expr.Sel), types.ExprString(expr))
+				log.Println("Unresolvable selector:", types.ExprString(expr.Sel), types.ExprString(expr))
 				return
 			}
 
@@ -403,17 +468,8 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 			for _, comp := range funcPath {
 				path = append(path, comp)
 				if prots, ok := l.protections[comp]; ok {
-					if missedProts := l.currentLockScope().missedProtections(path, prots, l.currentAccess()); len(missedProts) > 0 {
-						protStr := ""
-						many := false
-						for _, prot := range missedProts {
-							if many {
-								protStr += ", "
-							}
-							protStr += prot.lockObj().Name()
-							many = true
-						}
-						l.pass.Reportf(expr.Pos(), "%s is not held while accessing %s", protStr, comp.Name())
+					for _, warning := range l.currentLockScope().checkProtections(l.currentBlock(), path, prots, l.currentAccess()) {
+						l.pass.Reportf(expr.Pos(), "%s", warning)
 					}
 				}
 			}
@@ -422,9 +478,11 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 			if call, isCall := ancestorAs[*ast.CallExpr](l, 1); isCall && isLockOpPath(path) {
 				scope := l.currentLockScope()
 				if l.isWithinDeferScope() {
-					scope.applyDeferred(path)
-				} else if warnings := scope.apply(path); len(warnings) > 0 {
-					l.pass.Reportf(call.Pos(), "%s", strings.Join(warnings, ", "))
+					scope.applyDeferred(l.currentBlock(), path)
+				} else {
+					for _, warning := range scope.apply(l.currentBlock(), path) {
+						l.pass.Reportf(call.Pos(), "%s", warning)
+					}
 				}
 			}
 		}

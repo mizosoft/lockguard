@@ -199,7 +199,6 @@ func findStructObj(rootTyp *types.Struct, rootDef *types.Named, name string) can
 	for field := range rootTyp.Fields() {
 		if field.Embedded() {
 			q = append(q, field)
-			parent[field] = nil // nil here signifies an imaginary root.
 		}
 	}
 
@@ -248,9 +247,11 @@ func findStructObj(rootTyp *types.Struct, rootDef *types.Named, name string) can
 			}
 
 			if matchedObj != nil { // Found field.
-				path := canonicalPath{matchedObj}
-				for curr := matchedObjOwner; curr != (*types.Var)(nil); curr = parent[curr] {
+				path := canonicalPath{matchedObj, matchedObjOwner}
+				curr, ok := parent[matchedObjOwner]
+				for ok {
 					path = append(path, curr)
+					curr, ok = parent[curr]
 				}
 				slices.Reverse(path)
 				return path

@@ -17,18 +17,18 @@ func (d *rwLockHolder) deadlockByLockingMultipleTimes() {
 	// RLocking/RUnlocking multiple times is fine.
 	d.mu.RLock()
 	d.mu.RLock()
-	d.mu.Lock() // want `deadlock: mu - already read-locked`
+	d.mu.Lock() // want `deadlock: mu - already locked`
 	d.mu.Unlock()
 	d.mu.RUnlock()
 	d.mu.RUnlock()
 }
 
 func (d *rwLockHolder) misalignedLocking() {
-	d.mu.RUnlock() // want `mu - read-unlocking a non-read-locked lock`
+	d.mu.RUnlock() // want `mu - read-unlocking a non-locked lock`
 	d.mu.Unlock()  // want `mu - unlocking a non-locked lock`
 
 	d.mu.Lock()
-	d.mu.RUnlock() // want `mu - read-unlocking a non-read-locked lock`
+	d.mu.RUnlock() // want `mu - read-unlocking a non-locked lock`
 	d.mu.Unlock()
 
 	d.mu.RLock()
