@@ -5,6 +5,7 @@ import (
 	"go/token"
 	"go/types"
 	"log"
+	"slices"
 
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/inspect"
@@ -166,6 +167,16 @@ func (l *lockAnalyzer) analyzeDecl(decl ast.Decl) {
 	}
 }
 
+func toposort(block *cfg.Block, order []*cfg.Block, used map[int32]bool) []*cfg.Block {
+	used[block.Index] = true
+	for _, succ := range block.Succs {
+		if _, ok := used[succ.Index]; !ok {
+			order = toposort(succ, order, used)
+		}
+	}
+	return append(order, block)
+}
+
 func (l *lockAnalyzer) analyzeCfg(block *ast.BlockStmt, entry *cfg.Block) {
 	g := cfg.New(block, func(expr *ast.CallExpr) bool {
 		return true
@@ -194,45 +205,39 @@ func (l *lockAnalyzer) analyzeCfg(block *ast.BlockStmt, entry *cfg.Block) {
 		}
 	}
 
+	// Perform topological sorting so that each visited node will have its predecessors visited and their lock state
+	// merge into it before visiting.
 	used := make(map[int32]bool)
-
+	order := make([]*cfg.Block, 0)
 	for _, block := range g.Blocks {
 		if !block.Live {
 			continue
 		}
 
-		if _, ok := used[block.Index]; ok {
-			continue
+		if _, ok := used[block.Index]; !ok {
+			order = toposort(block, order, used)
 		}
+	}
+	slices.Reverse(order)
 
-		used[block.Index] = true
-		q := []*cfg.Block{block}
-		for len(q) > 0 {
-			b := q[0]
-			q = q[1:]
-
-			l.enterBlock(b)
-			for _, nd := range b.Nodes {
-				switch nd := nd.(type) {
-				case ast.Stmt:
-					l.analyzeStmt(nd)
-				case ast.Expr:
-					l.analyzeExpr(nd)
-				case *ast.ValueSpec:
-					l.analyzeExprs(nd.Values)
-				}
+	for _, b := range order {
+		l.enterBlock(b)
+		for _, nd := range b.Nodes {
+			switch nd := nd.(type) {
+			case ast.Stmt:
+				l.analyzeStmt(nd)
+			case ast.Expr:
+				l.analyzeExpr(nd)
+			case *ast.ValueSpec:
+				l.analyzeExprs(nd.Values)
 			}
-			l.exitBlock()
+		}
+		l.exitBlock()
 
-			// TODO handle back edges in case of loops. We can make the algorithm proceed to visit it one more time. That
-			//      way things like for { mut.Lock() } will be caught.
-			for _, succ := range b.Succs {
-				l.currentLockScope().merge(b, succ)
-				if _, ok := used[succ.Index]; !ok { // First time to visit.
-					q = append(q, succ)
-					used[succ.Index] = true
-				}
-			}
+		// TODO handle back edges in case of loops. We can make the algorithm proceed to visit it one more time. That
+		//      way things like for { mut.Lock() } will be caught.
+		for _, succ := range b.Succs {
+			l.currentLockScope().merge(b, succ)
 		}
 	}
 }
