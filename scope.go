@@ -192,12 +192,12 @@ func (s *lockScope) apply(block *cfg.Block, path canonicalPath) (warnings []stri
 func (s *lockScope) merge(src *cfg.Block, dst *cfg.Block) {
 	srcTree := s.trees[src]
 	if srcTree.root == nil {
-		s.trees[dst] = lockTree{newNode(nil)} // Create an empty tree with no lock info.
-	} else if dstTree, ok := s.trees[dst]; ok {
-		// If there is a dstTree, merge the tree.
+		srcTree.root = newNode(nil) // Assume this is an empty tree.
+	}
+
+	if dstTree, ok := s.trees[dst]; ok {
 		dstTree.root.mergeFrom(srcTree.root)
 	} else {
-		// Otherwise, copy the tree.
 		s.trees[dst] = lockTree{srcTree.root.copy()}
 	}
 }
@@ -379,6 +379,7 @@ func (n *node) mergeFrom(src *node) {
 	n.certainLockCount, n.certainRLockCount = min(n.certainLockCount, src.certainLockCount), min(n.certainRLockCount, src.certainRLockCount)
 	n.possibleLockCount, n.possibleRLockCount = max(n.possibleLockCount, src.possibleLockCount), max(n.possibleRLockCount, src.possibleRLockCount)
 
+	// Merge src children into dst.
 	for obj, srcChild := range src.children {
 		if dstChild, ok := n.children[obj]; ok {
 			dstChild.mergeFrom(srcChild)
@@ -386,6 +387,13 @@ func (n *node) mergeFrom(src *node) {
 			dstChild = newNode(srcChild.obj)
 			dstChild.mergeFrom(srcChild)
 			n.children[obj] = dstChild
+		}
+	}
+
+	// Handle dst children that don't exist in src - merge with empty state.
+	for obj, dstChild := range n.children {
+		if _, exists := src.children[obj]; !exists {
+			dstChild.mergeFrom(newNode(obj)) // Merge with empty node.
 		}
 	}
 }
