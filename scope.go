@@ -58,133 +58,229 @@ func newLockScope() *lockScope {
 	}
 }
 
-func (s *lockScope) apply(block *cfg.Block, path canonicalPath) (warnings []string) {
+func (s *lockScope) apply(block *cfg.Block, path canonicalPath) []string {
 	if !isLockOpPath(path) {
+		return nil
+	}
+
+	switch op := lockOpOf(path[len(path)-1].Name()); op {
+	case lockLockOp:
+		return s.lock(block, path[:len(path)-1], false)
+	case rLockLockOp:
+		return s.lock(block, path[:len(path)-1], true)
+	case unlockLockOp:
+		return s.unlock(block, path[:len(path)-1], false)
+	case rUnlockLockOp:
+		return s.unlock(block, path[:len(path)-1], true)
+	default:
+		panic("should've been checked by isLockOpPath to not be the case")
+	}
+}
+
+func (s *lockScope) lock(block *cfg.Block, path canonicalPath, isRLock bool) (warnings []string) {
+	tree, ok := s.trees[block]
+	if !ok {
+		tree = lockTree{newNode(nil)}
+		s.trees[block] = tree
+	}
+
+	var funcName string
+	if isRLock {
+		funcName = "RLock"
+	} else {
+		funcName = "Lock"
+	}
+
+	pathWithLockFunc := copyAppend(path, locateFromObjByName(path[len(path)-1], funcName)...)
+
+	treePath := tree.add(path)
+	for i := len(path) - 1; i >= 0; i-- {
+		// Check if the locking function is defined (directly or indirectly through embedded fields) by
+		// this object.
+		pathFromObj := locateFromObjByName(path[i], funcName)
+		if pathFromObj == nil {
+			return
+		}
+		if !slices.Equal(pathWithLockFunc[i+1:], pathFromObj) {
+			return // Locking is not transferable as paths to the locking function starts diverging.
+		}
+
+		kind := lockKindOfObject(path[i])
+		if kind == noneLockKind {
+			continue // Locking will only activate when we reach a lock object.
+		}
+
+		nd := treePath[i]
+		if !isRLock && (kind == normalLockKind || kind == rwLockKind) {
+			if nd.certainLockCount >= 1 || nd.certainRLockCount >= 1 {
+				warnings = append(warnings, fmt.Sprintf("deadlock: %v - already locked", nd.obj.Name()))
+			} else if nd.possibleLockCount >= 1 || nd.possibleRLockCount >= 1 {
+				warnings = append(warnings, fmt.Sprintf("deadlock: %v - possibly already locked", nd.obj.Name()))
+			}
+			nd.certainLockCount++
+			nd.possibleLockCount++
+		} else if isRLock && kind == rwLockKind {
+			if nd.certainLockCount >= 1 {
+				warnings = append(warnings, fmt.Sprintf("deadlock: %v - already locked", nd.obj.Name()))
+			} else if nd.possibleLockCount >= 1 {
+				warnings = append(warnings, fmt.Sprintf("deadlock: %v - possibly already locked", nd.obj.Name()))
+			}
+			nd.certainRLockCount++
+			nd.possibleRLockCount++
+		}
+
+		// Break if lock state is not transferable upwards.
+		switch obj := path[i].(type) {
+		case *types.Var:
+			if !obj.Embedded() {
+				return
+			}
+		default:
+			return
+		}
+	}
+	return
+}
+
+func (s *lockScope) possibleLock(block *cfg.Block, path canonicalPath, isRLock bool) (warnings []string) {
+	tree, ok := s.trees[block]
+	if !ok {
+		tree = lockTree{newNode(nil)}
+		s.trees[block] = tree
+	}
+
+	var funcName string
+	if isRLock {
+		funcName = "RLock"
+	} else {
+		funcName = "Lock"
+	}
+
+	pathWithLockFunc := copyAppend(path, locateFromObjByName(path[len(path)-1], funcName)...)
+
+	treePath := tree.add(path)
+	for i := len(path) - 1; i >= 0; i-- {
+		// Check if the locking function is defined (directly or indirectly through embedded fields) by
+		// this object.
+		pathFromObj := locateFromObjByName(path[i], funcName)
+		if pathFromObj == nil {
+			return
+		}
+		if !slices.Equal(pathWithLockFunc[i+1:], pathFromObj) {
+			return // Locking is not transferable as paths to the locking function starts diverging.
+		}
+
+		kind := lockKindOfObject(path[i])
+		if kind == noneLockKind {
+			continue // Locking will only activate when we reach a lock object.
+		}
+
+		nd := treePath[i]
+		if !isRLock && (kind == normalLockKind || kind == rwLockKind) {
+			if nd.certainLockCount >= 1 || nd.certainRLockCount >= 1 {
+				warnings = append(warnings, fmt.Sprintf("possible deadlock: %v - already locked", nd.obj.Name()))
+			} else if nd.possibleLockCount >= 1 || nd.possibleRLockCount >= 1 {
+				warnings = append(warnings, fmt.Sprintf("possible deadlock: %v - possibly already locked", nd.obj.Name()))
+			}
+			nd.possibleLockCount++
+		} else if isRLock && kind == rwLockKind {
+			if nd.certainLockCount >= 1 {
+				warnings = append(warnings, fmt.Sprintf("possible deadlock: %v - already locked", nd.obj.Name()))
+			} else if nd.possibleLockCount >= 1 {
+				warnings = append(warnings, fmt.Sprintf("possible deadlock: %v - possibly already locked", nd.obj.Name()))
+			}
+			nd.possibleRLockCount++
+		}
+
+		// Break if lock state is not transferable upwards.
+		switch obj := path[i].(type) {
+		case *types.Var:
+			if !obj.Embedded() {
+				return
+			}
+		default:
+			return
+		}
+	}
+	return
+}
+
+func (s *lockScope) unlock(block *cfg.Block, path canonicalPath, isRLock bool) (warnings []string) {
+	tree, ok := s.trees[block]
+
+	var treePath []*node
+	if ok {
+		treePath = tree.follow(path)
+	}
+
+	if len(treePath) == 0 {
+		if isRLock {
+			warnings = append(warnings, fmt.Sprintf("%v - read-unlocking a non-locked lock", path[len(path)-1].Name()))
+		} else {
+			warnings = append(warnings, fmt.Sprintf("%v - unlocking a non-locked lock", path[len(path)-1].Name()))
+		}
 		return
 	}
 
-	tree, ok := s.trees[block]
-	switch op := lockOpOf(path[len(path)-1].Name()); op {
-	case lockLockOp, rLockLockOp:
-		if !ok {
-			tree = lockTree{newNode(nil)}
-			s.trees[block] = tree
-		}
+	var funcName string
+	if isRLock {
+		funcName = "RUnlock"
+	} else {
+		funcName = "Unlock"
+	}
 
-		treePath := tree.add(path[:len(path)-1])
-		for i := len(path) - 2; i >= 0; i-- {
-			// Check if the locking/unlocking function is defined (directly or indirectly through embedded fields) by
-			// this object.
-			pathFromObj := locateFromObjByName(path[i], op.funcName())
-			if pathFromObj == nil {
-				return
-			}
-			if !slices.Equal(path[i+1:], pathFromObj) {
-				return // Op is not transferable.
-			}
+	pathWithUnlockFunc := copyAppend(path, locateFromObjByName(path[len(path)-1], funcName)...)
 
-			kind := lockKindOfObject(path[i])
-			if kind == noneLockKind {
-				continue
-			}
-
-			nd := treePath[i]
-			if op == lockLockOp && (kind == normalLockKind || kind == rwLockKind) {
-				if nd.certainLockCount >= 1 || nd.certainRLockCount >= 1 {
-					warnings = append(warnings, fmt.Sprintf("deadlock: %v - already locked", nd.obj.Name()))
-				} else if nd.possibleLockCount >= 1 || nd.possibleRLockCount >= 1 {
-					warnings = append(warnings, fmt.Sprintf("deadlock: %v - possibly already locked", nd.obj.Name()))
-				}
-				nd.certainLockCount++
-				nd.possibleLockCount++
-			} else if kind == rwLockKind { // op is rLockLockOp
-				if nd.certainLockCount >= 1 {
-					warnings = append(warnings, fmt.Sprintf("deadlock: %v - already locked", nd.obj.Name()))
-				} else if nd.possibleLockCount >= 1 {
-					warnings = append(warnings, fmt.Sprintf("deadlock: %v - possibly already locked", nd.obj.Name()))
-				}
-				nd.certainRLockCount++
-				nd.possibleRLockCount++
-			}
-
-			// Break if lock state is not transferable upwards.
-			switch obj := path[i].(type) {
-			case *types.Var:
-				if !obj.Embedded() {
-					return
-				}
-			default:
-				return
-			}
-		}
-	case unlockLockOp, rUnlockLockOp:
-		var treePath []*node
-		if ok {
-			treePath = tree.follow(path[:len(path)-1])
-		}
-
-		if len(treePath) == 0 {
-			if op == unlockLockOp {
-				warnings = append(warnings, fmt.Sprintf("%v - unlocking a non-locked lock", path[len(path)-2].Name()))
-			} else {
-				warnings = append(warnings, fmt.Sprintf("%v - read-unlocking a non-locked lock", path[len(path)-2].Name()))
-			}
+	for i := len(path) - 1; i >= 0; i-- {
+		// Check if the locking function is defined (directly or indirectly through embedded fields) by
+		// this object.
+		pathFromObj := locateFromObjByName(path[i], funcName)
+		if pathFromObj == nil {
 			return
 		}
+		if !slices.Equal(pathWithUnlockFunc[i+1:], pathFromObj) {
+			return // Unlocking is not transferable as paths to the unlocking function starts diverging.
+		}
 
-		for i := len(path) - 2; i >= 0; i-- {
-			// Check if the locking/unlocking function is defined (directly or indirectly through embedded fields) by
-			// this object's type.
-			pathFromObj := locateFromObjByName(path[i], op.funcName())
-			if pathFromObj == nil {
-				return
-			}
-			if !slices.Equal(path[i+1:], pathFromObj) {
-				return // Op is not transferable.
-			}
+		kind := lockKindOfObject(path[i])
+		if kind == noneLockKind {
+			continue // Unlocking will only activate when we reach a lock object.
+		}
 
-			kind := lockKindOfObject(path[i])
-			if kind == noneLockKind {
-				continue
-			}
-
-			nd := treePath[i]
-			if op == unlockLockOp {
-				if nd.certainLockCount <= 0 {
-					if nd.possibleLockCount > 0 {
-						warnings = append(warnings, fmt.Sprintf("%v - unlocking a possibly non-locked lock", nd.obj.Name()))
-						nd.possibleLockCount--
-					} else {
-						warnings = append(warnings, fmt.Sprintf("%v - unlocking a non-locked lock", nd.obj.Name()))
-					}
-				} else {
-					nd.certainLockCount--
+		nd := treePath[i]
+		if !isRLock {
+			if nd.certainLockCount <= 0 {
+				if nd.possibleLockCount > 0 {
+					warnings = append(warnings, fmt.Sprintf("%v - unlocking a possibly non-locked lock", nd.obj.Name()))
 					nd.possibleLockCount--
-				}
-			} else if nd.certainRLockCount <= 0 {
-				if nd.possibleRLockCount > 0 {
-					warnings = append(warnings, fmt.Sprintf("%v - read-unlocking a possibly non-locked lock", nd.obj.Name()))
-					nd.possibleRLockCount--
 				} else {
-					warnings = append(warnings, fmt.Sprintf("%v - read-unlocking a non-locked lock", nd.obj.Name()))
+					warnings = append(warnings, fmt.Sprintf("%v - unlocking a non-locked lock", nd.obj.Name()))
 				}
 			} else {
-				nd.certainRLockCount--
-				nd.possibleRLockCount--
+				nd.certainLockCount--
+				nd.possibleLockCount--
 			}
+		} else if nd.certainRLockCount <= 0 {
+			if nd.possibleRLockCount > 0 {
+				warnings = append(warnings, fmt.Sprintf("%v - read-unlocking a possibly non-locked lock", nd.obj.Name()))
+				nd.possibleRLockCount--
+			} else {
+				warnings = append(warnings, fmt.Sprintf("%v - read-unlocking a non-locked lock", nd.obj.Name()))
+			}
+		} else {
+			nd.certainRLockCount--
+			nd.possibleRLockCount--
+		}
 
-			// Break if lock state is not transferable upwards.
-			switch obj := path[i].(type) {
-			case *types.Var:
-				if !obj.Embedded() {
-					return
-				}
-			default:
+		// Break if lock state is not transferable upwards.
+		switch obj := path[i].(type) {
+		case *types.Var:
+			if !obj.Embedded() {
 				return
 			}
+		default:
+			return
 		}
-	case noneLockOp:
-		panic("should've been checked by isLockOpPath to not be the case")
 	}
 	return
 }

@@ -1,6 +1,7 @@
 package lockgaurd
 
 import (
+	"fmt"
 	"go/ast"
 	"go/token"
 	"go/types"
@@ -27,7 +28,7 @@ var Analyzer = &analysis.Analyzer{
 }
 
 func run(pass *analysis.Pass) (interface{}, error) {
-	if pass.Pkg.Name() != "a" {
+	if pass.Pkg.Name() != "c" {
 		return nil, nil
 	}
 
@@ -42,6 +43,14 @@ func run(pass *analysis.Pass) (interface{}, error) {
 		pass:        pass,
 	}
 	l.analyze(ins.Root())
+
+	//ins.Preorder([]ast.Node{(*ast.FuncDecl)(nil)}, func(a ast.Node) {
+	//	f := a.(*ast.FuncDecl)
+	//	g := cfg.New(f.Body, func(expr *ast.CallExpr) bool {
+	//		return true
+	//	})
+	//	fmt.Println(g.Format(pass.Fset))
+	//})
 
 	return nil, nil
 }
@@ -236,10 +245,117 @@ func (l *lockAnalyzer) analyzeCfg(block *ast.BlockStmt, entry *cfg.Block) {
 
 		// TODO handle back edges in case of loops. We can make the algorithm proceed to visit it one more time. That
 		//      way things like for { mut.Lock() } will be caught.
+
 		for _, succ := range b.Succs {
 			l.currentLockScope().merge(b, succ)
+
+			// If this is a conditional block with TryLock() expr, update successor lock state according to the result.
+			tryLockCalls := func() []tryLockCall {
+				switch succ.Kind {
+				case cfg.KindIfThen:
+					if expr, ok := b.Nodes[len(b.Nodes)-1].(ast.Expr); ok {
+						return l.evaluateTryLock(expr, true)
+					}
+				case cfg.KindIfElse:
+					if expr, ok := b.Nodes[len(b.Nodes)-1].(ast.Expr); ok {
+						return l.evaluateTryLock(expr, false)
+					}
+				default:
+					return nil
+				}
+				return nil
+			}()
+
+			fmt.Printf("Try lock calls: %v\n", tryLockCalls)
+
+			for _, call := range tryLockCalls {
+				switch call.state {
+				case trueTryLockState:
+					l.currentLockScope().lock(succ, call.path[:len(call.path)-1], call.isRLock)
+				case falseTryLockState:
+					// Do nothing.
+				case unknownTryLockState:
+					l.currentLockScope().possibleLock(succ, call.path[:len(call.path)-1], call.isRLock)
+				}
+			}
 		}
 	}
+}
+
+func (l *lockAnalyzer) evaluateTryLock(expr ast.Expr, evalTarget bool) []tryLockCall {
+	l.enter(expr)
+	defer l.exit()
+
+	switch expr := expr.(type) {
+	case *ast.CallExpr:
+		return l.evaluateTryLock(expr.Fun, evalTarget)
+	case *ast.SelectorExpr:
+		if _, inCall := ancestorAs[*ast.CallExpr](l, 1); !inCall {
+			return nil
+		}
+
+		if fn, ok := l.pass.TypesInfo.ObjectOf(expr.Sel).(*types.Func); ok && (fn.Name() == "TryLock" || fn.Name() == "TryRLock") {
+			loc := infoLocator(l.pass.TypesInfo)
+
+			xPath := loc.canonicalize(expr.X)
+			if xPath == nil {
+				log.Println("Unresolvable selector", types.ExprString(expr.X))
+				return nil
+			}
+
+			// Canonicalize the locking function path.
+			var path canonicalPath
+			if fn.Name() == "TryRLock" {
+				path = append(xPath, locateFromObjByName(xPath[len(xPath)-1], "RLock")...)
+			} else if fn.Name() == "TryLock" {
+				path = append(xPath, locateFromObjByName(xPath[len(xPath)-1], "Lock")...)
+			}
+
+			if !isLockOpPath(path) {
+				return nil // Not a lock.
+			}
+
+			var state tryLockState
+			if evalTarget {
+				state = trueTryLockState
+			} else {
+				state = falseTryLockState
+			}
+
+			var isRLock bool
+			if fn.Name() == "TryRLock" {
+				isRLock = true
+			} else {
+				isRLock = false
+			}
+			return []tryLockCall{
+				{
+					path:    path,
+					state:   state,
+					isRLock: isRLock,
+				},
+			}
+		}
+	case *ast.UnaryExpr:
+		if expr.Op == token.NOT {
+			return l.evaluateTryLock(expr.X, !evalTarget)
+		}
+	case *ast.BinaryExpr:
+		if expr.Op == token.LAND { // &&
+			if evalTarget {
+				return mergeAnd(l.evaluateTryLock(expr.X, true), l.evaluateTryLock(expr.Y, true))
+			} else {
+				return mergeOr(l.evaluateTryLock(expr.X, false), l.evaluateTryLock(expr.Y, false))
+			}
+		} else if expr.Op == token.LOR { // ||
+			if evalTarget {
+				return mergeOr(l.evaluateTryLock(expr.X, true), l.evaluateTryLock(expr.Y, true))
+			} else {
+				return mergeAnd(l.evaluateTryLock(expr.X, false), l.evaluateTryLock(expr.Y, false))
+			}
+		}
+	}
+	return nil
 }
 
 func (l *lockAnalyzer) analyzeStmt(stmt ast.Stmt) {
@@ -412,7 +528,7 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 		// TODO we can add other heuristics that check if the function is passed as a lambda to another std function that
 		//     is known to execute things inline.
 		// TODO If we feel adventurous, we can also track function literal assignments (e.g. fn = func() { ... }) and only
-		//     warn about the lock analysis results if the variable goes out of scope (passed somewhere or returned).
+		//     warn about the lock of analysis results if the variable goes out of scope (passed somewhere or returned).
 		// TODO this will be a false positive inside go statements because the function will be executed on another thread.
 		_, retainLockScope := ancestorAs[*ast.CallExpr](l, 1)
 		if !retainLockScope {
