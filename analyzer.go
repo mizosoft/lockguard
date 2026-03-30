@@ -1,7 +1,6 @@
 package lockgaurd
 
 import (
-	"fmt"
 	"go/ast"
 	"go/token"
 	"go/types"
@@ -246,36 +245,43 @@ func (l *lockAnalyzer) analyzeCfg(block *ast.BlockStmt, entry *cfg.Block) {
 		// TODO handle back edges in case of loops. We can make the algorithm proceed to visit it one more time. That
 		//      way things like for { mut.Lock() } will be caught.
 
+		// Extract branch condition once for all successors: if the block ends with an expression
+		// and has conditional successors, that expression is the if-condition.
+		var branchCond ast.Expr
+		if len(b.Nodes) > 0 {
+			branchCond, _ = b.Nodes[len(b.Nodes)-1].(ast.Expr)
+		}
+
 		for _, succ := range b.Succs {
 			l.currentLockScope().merge(b, succ)
 
-			// If this is a conditional block with TryLock() expr, update successor lock state according to the result.
-			tryLockCalls := func() []tryLockCall {
-				switch succ.Kind {
-				case cfg.KindIfThen:
-					if expr, ok := b.Nodes[len(b.Nodes)-1].(ast.Expr); ok {
-						return l.evaluateTryLock(expr, true)
-					}
-				case cfg.KindIfElse:
-					if expr, ok := b.Nodes[len(b.Nodes)-1].(ast.Expr); ok {
-						return l.evaluateTryLock(expr, false)
-					}
-				default:
-					return nil
-				}
-				return nil
-			}()
+			if branchCond == nil {
+				continue
+			}
 
-			fmt.Printf("Try lock calls: %v\n", tryLockCalls)
+			// Evaluate TryLock state for the branch taken into this successor.
+			var calls []tryLockCall
+			switch succ.Kind {
+			case cfg.KindIfThen:
+				calls = l.evaluateTryLock(branchCond, true)
+			case cfg.KindIfElse:
+				calls = l.evaluateTryLock(branchCond, false)
+			default:
+				continue
+			}
 
-			for _, call := range tryLockCalls {
+			for _, call := range calls {
 				switch call.state {
 				case trueTryLockState:
-					l.currentLockScope().lock(succ, call.path[:len(call.path)-1], call.isRLock)
+					for _, w := range l.currentLockScope().lock(succ, call.path[:len(call.path)-1], call.isRLock) {
+						l.pass.Reportf(branchCond.Pos(), "%s", w)
+					}
 				case falseTryLockState:
-					// Do nothing.
+					// Lock not acquired — nothing to apply.
 				case unknownTryLockState:
-					l.currentLockScope().possibleLock(succ, call.path[:len(call.path)-1], call.isRLock)
+					for _, w := range l.currentLockScope().possibleLock(succ, call.path[:len(call.path)-1], call.isRLock) {
+						l.pass.Reportf(branchCond.Pos(), "%s", w)
+					}
 				}
 			}
 		}
