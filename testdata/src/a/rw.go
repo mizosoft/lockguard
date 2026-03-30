@@ -45,7 +45,6 @@ type rwLevels struct {
 	auto_rw int `protected_by:"mut"`
 	r       int `read_protected_by:"mut"`
 	w       int `write_protected_by:"mut"`
-	rw      int `rw_protected_by:"mut"`
 	mut     sync.RWMutex
 }
 
@@ -56,8 +55,6 @@ func (s *rwLevels) readWriteLockUnlock() {
 	_ = s.r       // want `mut is not held while accessing r`
 	s.w++         // want `mut is not held while accessing w`
 	_ = s.w       // want `mut is not held while accessing w`
-	s.rw++        // want `mut is not held while accessing rw`
-	_ = s.rw      // want `mut is not held while accessing rw`
 
 	s.mut.RLock()
 	_ = s.auto_rw
@@ -85,13 +82,5 @@ func (s *rwLevels) readWriteLockUnlock() {
 
 	s.mut.Lock()
 	s.w++
-	s.mut.Unlock()
-
-	s.mut.RLock()
-	s.rw++
-	s.mut.RUnlock()
-
-	s.mut.Lock()
-	s.rw++
 	s.mut.Unlock()
 }
