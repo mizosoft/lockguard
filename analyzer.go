@@ -27,7 +27,7 @@ var Analyzer = &analysis.Analyzer{
 }
 
 func run(pass *analysis.Pass) (interface{}, error) {
-	if pass.Pkg.Name() != "c" {
+	if pass.Pkg.Name() != "a" {
 		return nil, nil
 	}
 
