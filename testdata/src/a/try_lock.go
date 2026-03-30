@@ -80,7 +80,7 @@ func negatedTryLock() {
 // ============================================================================
 
 type RWS struct {
-	data int `rw_protected_by:"mu"` // accepts either Lock or RLock
+	data int `read_protected_by:"mu"` // accepts either Lock or RLock
 	mu   sync.RWMutex
 }
 

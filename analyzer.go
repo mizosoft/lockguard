@@ -17,6 +17,8 @@ import (
 // TODO we should handle facts exported from other packages.
 // TODO we can also support once.Do patterns.
 
+var debug bool
+
 // Analyzer Checks lock-protected accesses.
 var Analyzer = &analysis.Analyzer{
 	Name:      "lockguard",
@@ -26,11 +28,11 @@ var Analyzer = &analysis.Analyzer{
 	FactTypes: []analysis.Fact{new(protectionFact)},
 }
 
-func run(pass *analysis.Pass) (interface{}, error) {
-	if pass.Pkg.Name() != "a" {
-		return nil, nil
-	}
+func init() {
+	Analyzer.Flags.BoolVar(&debug, "debug", false, "enable debug output")
+}
 
+func run(pass *analysis.Pass) (interface{}, error) {
 	ins := pass.ResultOf[inspect.Analyzer].(*inspector.Inspector)
 
 	f := newFinder(pass)
@@ -42,14 +44,6 @@ func run(pass *analysis.Pass) (interface{}, error) {
 		pass:        pass,
 	}
 	l.analyze(ins.Root())
-
-	//ins.Preorder([]ast.Node{(*ast.FuncDecl)(nil)}, func(a ast.Node) {
-	//	f := a.(*ast.FuncDecl)
-	//	g := cfg.New(f.Body, func(expr *ast.CallExpr) bool {
-	//		return true
-	//	})
-	//	fmt.Println(g.Format(pass.Fset))
-	//})
 
 	return nil, nil
 }
@@ -102,14 +96,18 @@ func (l *lockAnalyzer) currentNode() ast.Node {
 
 func (l *lockAnalyzer) enterBlock(block *cfg.Block) {
 	l.blocks = append(l.blocks, block)
-	log.Printf("Entering CFG block: <%v>\n", block)
-	l.currentLockScope().print(block)
+	if debug {
+		log.Printf("Entering CFG block: <%v>\n", block)
+		l.currentLockScope().print(block)
+	}
 }
 
 func (l *lockAnalyzer) exitBlock() {
 	block := l.currentBlock()
-	log.Printf("Exiting CFG block: <%v>\n", block)
-	l.currentLockScope().print(block)
+	if debug {
+		log.Printf("Exiting CFG block: <%v>\n", block)
+		l.currentLockScope().print(block)
+	}
 	l.blocks = l.blocks[:len(l.blocks)-1]
 }
 
@@ -161,6 +159,9 @@ func (l *lockAnalyzer) analyzeDecl(decl ast.Decl) {
 
 	switch decl := decl.(type) {
 	case *ast.FuncDecl:
+		if decl.Body == nil {
+			return // External/declared-only function; no body to analyze.
+		}
 		l.enterLockScope()
 		l.analyzeCfg(decl.Body, nil)
 		l.exitLockScope()
@@ -190,7 +191,9 @@ func (l *lockAnalyzer) analyzeCfg(block *ast.BlockStmt, entry *cfg.Block) {
 		return true
 	})
 
-	log.Println("Generated CFG block", "\n`", g.Format(l.pass.Fset), "`")
+	if debug {
+		log.Println("Generated CFG block", "\n`", g.Format(l.pass.Fset), "`")
+	}
 
 	if entry != nil {
 		l.currentLockScope().merge(entry, g.Blocks[0])
@@ -305,7 +308,9 @@ func (l *lockAnalyzer) evaluateTryLock(expr ast.Expr, evalTarget bool) []tryLock
 
 			xPath := loc.canonicalize(expr.X)
 			if xPath == nil {
-				log.Println("Unresolvable selector", types.ExprString(expr.X))
+				if debug {
+					log.Println("Unresolvable selector", types.ExprString(expr.X))
+				}
 				return nil
 			}
 
@@ -537,6 +542,7 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 		//     warn about the lock of analysis results if the variable goes out of scope (passed somewhere or returned).
 		// TODO this will be a false positive inside go statements because the function will be executed on another thread.
 		_, retainLockScope := ancestorAs[*ast.CallExpr](l, 1)
+		retainLockScope = retainLockScope && len(l.lockScopes) > 0
 		if !retainLockScope {
 			l.enterLockScope()
 		}
@@ -563,7 +569,9 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 
 		xPath := loc.canonicalize(expr.X)
 		if xPath == nil {
-			log.Println("Unresolvable selector", types.ExprString(expr.X))
+			if debug {
+				log.Println("Unresolvable selector", types.ExprString(expr.X))
+			}
 			return
 		}
 
@@ -571,7 +579,9 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 		case *types.Var:
 			fieldPath := locateFromObjByName(xPath[len(xPath)-1], obj.Name())
 			if fieldPath == nil {
-				log.Println("Unresolvable selector1", types.ExprString(expr.Sel), types.ExprString(expr))
+				if debug {
+					log.Println("Unresolvable selector1", types.ExprString(expr.Sel), types.ExprString(expr))
+				}
 				return
 			}
 
@@ -587,7 +597,9 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 		case *types.Func:
 			funcPath := locateFromObjByName(xPath[len(xPath)-1], obj.Name())
 			if funcPath == nil {
-				log.Println("Unresolvable selector:", types.ExprString(expr.Sel), types.ExprString(expr))
+				if debug {
+					log.Println("Unresolvable selector:", types.ExprString(expr.Sel), types.ExprString(expr))
+				}
 				return
 			}
 

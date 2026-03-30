@@ -19,39 +19,38 @@ const (
 	protectedBy      protectionDirective = "protected_by"
 	readProtectedBy  protectionDirective = "read_protected_by"
 	writeProtectedBy protectionDirective = "write_protected_by"
-	rwProtectedBy    protectionDirective = "rw_protected_by"
 )
 
 var protectionDirectives = []protectionDirective{
-	protectedBy, readProtectedBy, writeProtectedBy, rwProtectedBy,
+	protectedBy, readProtectedBy, writeProtectedBy,
 }
 
 func (directive protectionDirective) isSupportedBy(kind lockKind) bool {
 	switch directive {
 	case protectedBy:
 		return kind == rwLockKind || kind == normalLockKind
-	case readProtectedBy, writeProtectedBy, rwProtectedBy:
+	case readProtectedBy, writeProtectedBy:
 		return kind == rwLockKind
 	default:
 		panic("unknown protectionDirective: " + directive)
 	}
 }
 
-func (directive protectionDirective) isSatisfiedBy(kind lockKind, isRead bool, access accessKind) bool {
+func (directive protectionDirective) isSatisfiedBy(kind lockKind, isRLocked bool, fieldAccess accessKind) bool {
 	switch directive {
 	case protectedBy:
 		switch kind {
 		case normalLockKind:
 			return true
 		case rwLockKind:
-			return access == readAccessKind || !isRead
+			return fieldAccess == readAccessKind || !isRLocked
 		default:
 			return false
 		}
-	case readProtectedBy, rwProtectedBy:
+	case readProtectedBy:
 		return kind == rwLockKind // Either Lock or RLock would work here.
 	case writeProtectedBy:
-		return kind == rwLockKind && !isRead
+		return kind == rwLockKind && !isRLocked
 	default:
 		panic("unknown protectionDirective: " + directive)
 	}
@@ -83,7 +82,7 @@ func (p protection) defaultLockUnlockFuncs() (string, string) {
 	switch p.directive {
 	case protectedBy, writeProtectedBy:
 		return "Lock", "Unlock"
-	case readProtectedBy, rwProtectedBy:
+	case readProtectedBy:
 		return "RLock", "RUnlock"
 	default:
 		panic("unknown protectionDirective: " + p.directive)
@@ -193,7 +192,9 @@ func (f *protectionsFinder) findStructProtections(typ *ast.StructType, spec *ast
 				for _, name := range field.Names {
 					if vr, ok := f.pass.TypesInfo.ObjectOf(name).(*types.Var); vr != nil && ok {
 						f.protections[vr] = prots
-						fmt.Println(vr, "protected by", fmt.Sprintf("%v", f.protections[vr]))
+						if debug {
+							fmt.Println(vr, "protected by", fmt.Sprintf("%v", f.protections[vr]))
+						}
 
 						// Export protection info as a fact to other packages.
 						if name.IsExported() {
@@ -208,7 +209,9 @@ func (f *protectionsFinder) findStructProtections(typ *ast.StructType, spec *ast
 				name := nameOfEmbeddedField(field.Type)
 				if vr, ok := f.pass.TypesInfo.ObjectOf(name).(*types.Var); vr != nil && ok {
 					f.protections[vr] = prots
-					fmt.Println(vr, "protected by", fmt.Sprintf("%v", f.protections[vr]))
+					if debug {
+						fmt.Println(vr, "protected by", fmt.Sprintf("%v", f.protections[vr]))
+					}
 
 					// Export protection info as a fact to other packages.
 					if name.IsExported() {
@@ -235,7 +238,7 @@ func (f *protectionsFinder) findFuncProtections(funcType *ast.FuncDecl, file *as
 	globalLocator := scopeLocator(f.pass.Pkg.Scope()).fallback(importsLocator(file, f.pass.TypesInfo))
 
 	var receiver *types.Var
-	if funcType.Recv != nil {
+	if funcType.Recv != nil && len(funcType.Recv.List) > 0 && len(funcType.Recv.List[0].Names) > 0 {
 		receiver = f.pass.TypesInfo.ObjectOf(funcType.Recv.List[0].Names[0]).(*types.Var)
 	}
 
@@ -268,7 +271,9 @@ func (f *protectionsFinder) findFuncProtections(funcType *ast.FuncDecl, file *as
 
 	// Export protection info as a fact to other packages.
 	if len(f.protections[fnc]) > 0 {
-		fmt.Println(fnc, "protected by", fmt.Sprintf("%v", f.protections[fnc]))
+		if debug {
+			fmt.Println(fnc, "protected by", fmt.Sprintf("%v", f.protections[fnc]))
+		}
 
 		if funcType.Name.IsExported() {
 			f.pass.ExportObjectFact(fnc, &protectionFact{
@@ -283,6 +288,7 @@ func (f *protectionsFinder) findVarDeclProtections(decl *ast.GenDecl, file *ast.
 		return
 	}
 
+	// Simulate symbol lookup by first looking into package scope, then look into imports for package names.
 	loc := scopeLocator(f.pass.Pkg.Scope()).fallback(importsLocator(file, f.pass.TypesInfo))
 
 	var declProts []protection
@@ -318,7 +324,9 @@ func (f *protectionsFinder) findVarDeclProtections(decl *ast.GenDecl, file *ast.
 			for _, name := range spec.Names {
 				if vr, ok := f.pass.TypesInfo.ObjectOf(name).(*types.Var); ok {
 					f.protections[vr] = specProts
-					fmt.Println(vr, "protected by", fmt.Sprintf("%v", specProts))
+					if debug {
+						fmt.Println(vr, "protected by", fmt.Sprintf("%v", specProts))
+					}
 
 					// Export protection info as a fact to other packages.
 					if name.IsExported() {

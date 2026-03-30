@@ -5,7 +5,6 @@ import "sync"
 type rw struct {
 	readers int `read_protected_by:"mu"`
 	writers int `write_protected_by:"mu"`
-	both    int `rw_protected_by:"mu"`
 	auto    int `protected_by:"mu"`
 	mu      sync.RWMutex
 }
@@ -37,7 +36,6 @@ func (r *rw) upgradeLockPattern() {
 func (r *rw) mixedAccess() {
 	r.mu.RLock()
 	_ = r.readers // OK
-	_ = r.both    // OK (RLock sufficient for rw_protected_by)
 	r.writers++   // want `mu is not held while accessing writers`
 	r.auto++      // want `mu is not held while accessing auto`
 	r.mu.RUnlock()
