@@ -19,14 +19,6 @@ type tryLockCall struct {
 	isRLock bool
 }
 
-func (state tryLockState) negate() tryLockState {
-	return []tryLockState{
-		trueTryLockState:    falseTryLockState,
-		falseTryLockState:   trueTryLockState,
-		unknownTryLockState: unknownTryLockState,
-	}[state]
-}
-
 func (state tryLockState) String() string {
 	return []string{
 		trueTryLockState:    "true",
@@ -51,8 +43,9 @@ func mergeAnd(left []tryLockCall, right []tryLockCall) []tryLockCall {
 				result = append(result, leftCall)
 			} else {
 				result = append(result, tryLockCall{
-					path:  leftCall.path,
-					state: unknownTryLockState,
+					path:    leftCall.path,
+					state:   unknownTryLockState,
+					isRLock: leftCall.isRLock,
 				})
 			}
 		} else {
@@ -83,14 +76,16 @@ func mergeOr(left []tryLockCall, right []tryLockCall) []tryLockCall {
 				result = append(result, leftCall)
 			} else {
 				result = append(result, tryLockCall{
-					path:  leftCall.path,
-					state: unknownTryLockState,
+					path:    leftCall.path,
+					state:   unknownTryLockState,
+					isRLock: leftCall.isRLock,
 				})
 			}
 		} else {
 			result = append(result, tryLockCall{
-				path:  leftCall.path,
-				state: unknownTryLockState,
+				path:    leftCall.path,
+				state:   unknownTryLockState,
+				isRLock: leftCall.isRLock,
 			})
 		}
 	}
@@ -101,8 +96,9 @@ func mergeOr(left []tryLockCall, right []tryLockCall) []tryLockCall {
 			return slices.Equal(rightCall.path, leftCall.path)
 		}) {
 			result = append(result, tryLockCall{
-				path:  rightCall.path,
-				state: unknownTryLockState,
+				path:    rightCall.path,
+				state:   unknownTryLockState,
+				isRLock: rightCall.isRLock,
 			})
 		}
 	}
