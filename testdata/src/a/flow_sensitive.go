@@ -20,7 +20,7 @@ func (f *flowSensitive) conditionalLockAcquire(needsLock bool) {
 		defer f.mu.Unlock()
 	}
 	// After the if, lock is POSSIBLY held
-	f.x++ // want `mu is possibly not held while accessing x`
+	f.x++ // want `writing 'x' requires holding 'mu' \(not held on all paths\)`
 }
 
 func (f *flowSensitive) multipleConditionalPaths(a, b bool) {
@@ -30,10 +30,10 @@ func (f *flowSensitive) multipleConditionalPaths(a, b bool) {
 		f.mu.Lock()
 	}
 	// Lock is possibly held (acquired in some paths but not all)
-	f.x++ // want `mu is possibly not held while accessing x`
+	f.x++ // want `writing 'x' requires holding 'mu' \(not held on all paths\)`
 
 	if a || b {
-		f.mu.Unlock() // want `unlocking a possibly non-locked lock`
+		f.mu.Unlock() // want `releasing 'mu' that may not be held`
 	}
 }
 
@@ -61,7 +61,7 @@ func (f *flowSensitive) inconsistentUnlock(cond bool) {
 	}
 
 	// Lock is possibly held here
-	f.x++ // want `mu is possibly not held while accessing x`
+	f.x++ // want `writing 'x' requires holding 'mu' \(not held on all paths\)`
 }
 
 func (f *flowSensitive) lockAfterBranch(cond bool) {
@@ -72,8 +72,8 @@ func (f *flowSensitive) lockAfterBranch(cond bool) {
 	}
 
 	if locked {
-		f.x++         // want `mu is possibly not held while accessing x`
-		f.mu.Unlock() // want `unlocking a possibly non-locked lock`
+		f.x++         // want `writing 'x' requires holding 'mu' \(not held on all paths\)`
+		f.mu.Unlock() // want `releasing 'mu' that may not be held`
 	}
 }
 
@@ -91,7 +91,7 @@ func (g *gotoTest) gotoSkipsLock() {
 	g.mu.Lock() // This is skipped
 
 skip:
-	g.x++ // want `mu is not held while accessing x`
+	g.x++ // want `writing 'x' requires holding 'mu'`
 }
 
 func (g *gotoTest) gotoToLocked() {
@@ -120,7 +120,7 @@ func (g *gotoTest) gotoWithinLock() {
 unlock:
 	g.mu.Unlock()
 
-	g.x++ // want `mu is not held while accessing x`
+	g.x++ // want `writing 'x' requires holding 'mu'`
 }
 
 // ============================================================================
@@ -173,14 +173,14 @@ func (c *complexSwitch) switchLockInCase(mode int) {
 		c.mu.Lock()
 		c.state++ // OK
 	case 2:
-		c.state++ // want `mu is not held while accessing state`
+		c.state++ // want `writing 'state' requires holding 'mu'`
 	case 3:
 		c.mu.Lock()
 		c.state++ // OK
 	}
 
 	// Lock is possibly held (acquired in some cases)
-	c.state++ // want `mu is possibly not held while accessing state`
+	c.state++ // want `writing 'state' requires holding 'mu' \(not held on all paths\)`
 }
 
 func (c *complexSwitch) switchWithFallthrough(mode int) {
@@ -189,8 +189,8 @@ func (c *complexSwitch) switchWithFallthrough(mode int) {
 		c.mu.Lock()
 		fallthrough
 	case 2:
-		c.state++     // want `mu is possibly not held while accessing state`
-		c.mu.Unlock() // want `unlocking a possibly non-locked lock`
+		c.state++     // want `writing 'state' requires holding 'mu' \(not held on all paths\)`
+		c.mu.Unlock() // want `releasing 'mu' that may not be held`
 	}
 }
 
@@ -205,7 +205,7 @@ type channelTest struct {
 }
 
 func (c *channelTest) sendProtectedData() {
-	c.ch <- c.data // want `mu is not held while accessing data`
+	c.ch <- c.data // want `reading 'data' requires holding 'mu'`
 
 	c.mu.Lock()
 	c.ch <- c.data // OK
@@ -213,7 +213,7 @@ func (c *channelTest) sendProtectedData() {
 }
 
 func (c *channelTest) receiveToProtected() {
-	c.data = <-c.ch // want `mu is not held while accessing data`
+	c.data = <-c.ch // want `writing 'data' requires holding 'mu'`
 
 	c.mu.Lock()
 	c.data = <-c.ch // OK
@@ -222,8 +222,8 @@ func (c *channelTest) receiveToProtected() {
 
 func (c *channelTest) selectWithProtected() {
 	select {
-	case c.data = <-c.ch: // want `mu is not held while accessing data`
-	case c.ch <- c.data: // want `mu is not held while accessing data`
+	case c.data = <-c.ch: // want `writing 'data' requires holding 'mu'`
+	case c.ch <- c.data: // want `reading 'data' requires holding 'mu'`
 	}
 
 	c.mu.Lock()
@@ -245,10 +245,10 @@ type collectionTest struct {
 }
 
 func (c *collectionTest) mapAccess() {
-	c.mapData["key"] = 42            // want `mu is not held while accessing mapData`
-	_ = c.mapData["key"]             // want `mu is not held while accessing mapData`
-	delete(c.mapData, "key")         // want `mu is not held while accessing mapData`
-	c.mapData = make(map[string]int) // want `mu is not held while accessing mapData`
+	c.mapData["key"] = 42            // want `writing 'mapData' requires holding 'mu'`
+	_ = c.mapData["key"]             // want `reading 'mapData' requires holding 'mu'`
+	delete(c.mapData, "key")         // want `reading 'mapData' requires holding 'mu'`
+	c.mapData = make(map[string]int) // want `writing 'mapData' requires holding 'mu'`
 
 	c.mu.Lock()
 	c.mapData["key"] = 42    // OK
@@ -258,10 +258,10 @@ func (c *collectionTest) mapAccess() {
 }
 
 func (c *collectionTest) sliceAccess() {
-	c.sliceData[0] = 42                  // want `mu is not held while accessing sliceData`
-	_ = c.sliceData[0]                   // want `mu is not held while accessing sliceData`
-	c.sliceData = append(c.sliceData, 1) // want `mu is not held while accessing sliceData`
-	_ = len(c.sliceData)                 // want `mu is not held while accessing sliceData`
+	c.sliceData[0] = 42                  // want `writing 'sliceData' requires holding 'mu'`
+	_ = c.sliceData[0]                   // want `reading 'sliceData' requires holding 'mu'`
+	c.sliceData = append(c.sliceData, 1) // want `writing 'sliceData' requires holding 'mu'`
+	_ = len(c.sliceData)                 // want `reading 'sliceData' requires holding 'mu'`
 
 	c.mu.Lock()
 	c.sliceData[0] = 42                  // OK
@@ -271,7 +271,7 @@ func (c *collectionTest) sliceAccess() {
 }
 
 func (c *collectionTest) rangeOverProtected() {
-	for k, v := range c.mapData { // want `mu is not held while accessing mapData`
+	for k, v := range c.mapData { // want `reading 'mapData' requires holding 'mu'`
 		_ = k
 		_ = v
 	}
@@ -302,7 +302,7 @@ func (m *multiReturn) multipleReturns(a, b bool) {
 	}
 
 	if b {
-		m.x++ // want `mu is not held while accessing x`
+		m.x++ // want `writing 'x' requires holding 'mu'`
 		return
 	}
 
@@ -423,7 +423,7 @@ type outerStruct struct {
 }
 
 func (o *outerStruct) callMethodOnProtected() {
-	_ = o.inner.getValue() // want `mu is not held while accessing inner`
+	_ = o.inner.getValue() // want `reading 'inner' requires holding 'mu'`
 
 	o.mu.Lock()
 	_ = o.inner.getValue() // OK
@@ -445,11 +445,11 @@ type protectedCounter struct {
 }
 
 func (p *protectedCounter) Increment() {
-	p.count++ // want `mu is not held while accessing count`
+	p.count++ // want `writing 'count' requires holding 'mu'`
 }
 
 func (p *protectedCounter) Value() int {
-	return p.count // want `mu is not held while accessing count`
+	return p.count // want `reading 'count' requires holding 'mu'`
 }
 
 func (p *protectedCounter) CorrectIncrement() {
@@ -470,7 +470,7 @@ type arrayElement struct {
 func arrayOfProtected() {
 	var arr [5]arrayElement
 
-	arr[0].x++ // want `mu is not held while accessing x`
+	arr[0].x++ // want `writing 'x' requires holding 'mu'`
 
 	arr[0].mu.Lock()
 	arr[0].x++ // OK
@@ -480,7 +480,7 @@ func arrayOfProtected() {
 func sliceOfProtected() {
 	arr := make([]arrayElement, 5)
 
-	arr[0].x++ // want `mu is not held while accessing x`
+	arr[0].x++ // want `writing 'x' requires holding 'mu'`
 
 	arr[0].mu.Lock()
 	arr[0].x++ // OK
@@ -498,7 +498,7 @@ type loopCondition struct {
 
 func (l *loopCondition) lockInCondition() {
 	// Lock check in condition without holding lock
-	for l.counter < 10 { // want `mu is not held while accessing counter`
+	for l.counter < 10 { // want `reading 'counter' requires holding 'mu'`
 		l.mu.Lock()
 		l.counter++ // OK
 		l.mu.Unlock()
@@ -524,7 +524,7 @@ type platformSpecific struct {
 }
 
 func (p *platformSpecific) linuxOnly() {
-	p.x++ // want `mu is not held while accessing x`
+	p.x++ // want `writing 'x' requires holding 'mu'`
 }
 
 // ============================================================================
@@ -537,7 +537,7 @@ func anonymousStructs() {
 		mu sync.Mutex
 	}{}
 
-	s.x++ // want `mu is not held while accessing x`
+	s.x++ // want `writing 'x' requires holding 'mu'`
 
 	s.mu.Lock()
 	s.x++ // OK

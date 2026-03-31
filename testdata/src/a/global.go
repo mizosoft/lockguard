@@ -11,7 +11,7 @@ var globalMut sync.Mutex
 var globalI int
 
 func accessGlobalI() {
-	globalI++ // want `globalMut is not held while accessing globalI`
+	globalI++ // want `writing 'globalI' requires holding 'globalMut'`
 
 	globalMut.Lock()
 	globalI++
@@ -24,7 +24,7 @@ func globalFunc() {
 }
 
 func accessGlobalFunc() {
-	globalFunc() // want `globalMut is not held while accessing globalFunc`
+	globalFunc() // want `reading 'globalFunc' requires holding 'globalMut'`
 
 	globalMut.Lock()
 	globalFunc()
@@ -43,17 +43,16 @@ func globalFunc2() {
 }
 
 func globalWith2Locks() {
-	globalJ++     // want `globalMut, GlobalMut is not held while accessing globalJ`
-	globalFunc2() // want `globalMut, GlobalMut is not held while accessing globalFunc2`
+	globalJ++     // want `writing 'globalJ' requires holding 'globalMut' and 'b\.GlobalMut'`
+	globalFunc2() // want `reading 'globalFunc2' requires holding 'globalMut' and 'b\.GlobalMut'`
 
 	globalMut.Lock()
-	globalJ++     // want `GlobalMut is not held while accessing globalJ`
-	globalFunc2() // want `GlobalMut is not held while accessing globalFunc2`
+	globalJ++     // want `writing 'globalJ' requires holding 'b\.GlobalMut'`
+	globalFunc2() // want `reading 'globalFunc2' requires holding 'b\.GlobalMut'`
 	globalMut.Unlock()
 
 	b.GlobalMut.Lock()
-	globalJ++     // want `globalMut is not held while accessing globalJ`
-	globalFunc2() // want `globalMut is not held while accessing globalFunc2`
+	globalJ++     // want `writing 'globalJ' requires holding 'globalMut'`
+	globalFunc2() // want `reading 'globalFunc2' requires holding 'globalMut'`
 	b.GlobalMut.Unlock()
-
 }

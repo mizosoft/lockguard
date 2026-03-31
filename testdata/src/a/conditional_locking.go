@@ -23,7 +23,7 @@ func (c *conditionalLock) lockInIf(cond bool) {
 		c.mu.Unlock()
 	}
 	// After if: lock is NOT held (all paths that acquired it released it)
-	c.data++ // want `mu is not held while accessing data`
+	c.data++ // want `writing 'c\.data' requires holding 'c\.mu'`
 }
 
 func (c *conditionalLock) lockInIfNoUnlock(cond bool) {
@@ -32,7 +32,7 @@ func (c *conditionalLock) lockInIfNoUnlock(cond bool) {
 		c.data++ // OK
 	}
 	// After if: lock is POSSIBLY held (some paths hold it)
-	c.data++ // want `mu is possibly not held while accessing data`
+	c.data++ // want `writing 'c\.data' requires holding 'c\.mu' \(not held on all paths\)`
 }
 
 func (c *conditionalLock) lockBeforeIf(cond bool) {
@@ -67,7 +67,7 @@ func (c *conditionalLock) lockInOneBranch(cond bool) {
 		// No lock
 	}
 	// After if-else: lock is POSSIBLY held
-	c.data++ // want `mu is possibly not held while accessing data`
+	c.data++ // want `writing 'c\.data' requires holding 'c\.mu' \(not held on all paths\)`
 }
 
 func (c *conditionalLock) lockInElseOnly(cond bool) {
@@ -77,7 +77,7 @@ func (c *conditionalLock) lockInElseOnly(cond bool) {
 		c.mu.Lock()
 	}
 	// After if-else: lock is POSSIBLY held
-	c.data++ // want `mu is possibly not held while accessing data`
+	c.data++ // want `writing 'c\.data' requires holding 'c\.mu' \(not held on all paths\)`
 }
 
 func (c *conditionalLock) unlockInOneBranch(cond bool) {
@@ -88,7 +88,7 @@ func (c *conditionalLock) unlockInOneBranch(cond bool) {
 		c.mu.Unlock()
 	}
 	// After if: lock is POSSIBLY held
-	c.data++ // want `mu is possibly not held while accessing data`
+	c.data++ // want `writing 'c\.data' requires holding 'c\.mu' \(not held on all paths\)`
 }
 
 // ============================================================================
@@ -104,7 +104,7 @@ func (c *conditionalLock) lockInSomeElseIf(a, b, cond bool) {
 		// No lock
 	}
 	// Lock is POSSIBLY held (some but not all paths)
-	c.data++ // want `mu is possibly not held while accessing data`
+	c.data++ // want `writing 'c\.data' requires holding 'c\.mu' \(not held on all paths\)`
 }
 
 func (c *conditionalLock) lockInAllElseIfPaths(a, b bool) {
@@ -134,7 +134,7 @@ func (c *conditionalLock) nestedIfLockOuter(cond1, cond2 bool) {
 		c.data++ // OK
 		c.mu.Unlock()
 	}
-	c.data++ // want `mu is not held while accessing data`
+	c.data++ // want `writing 'c\.data' requires holding 'c\.mu'`
 }
 
 func (c *conditionalLock) nestedIfLockInner(cond1, cond2 bool) {
@@ -144,9 +144,9 @@ func (c *conditionalLock) nestedIfLockInner(cond1, cond2 bool) {
 			c.data++ // OK
 			c.mu.Unlock()
 		}
-		c.data++ // want `mu is not held while accessing data`
+		c.data++ // want `writing 'c\.data' requires holding 'c\.mu'`
 	}
-	c.data++ // want `mu is not held while accessing data`
+	c.data++ // want `writing 'c\.data' requires holding 'c\.mu'`
 }
 
 func (c *conditionalLock) nestedIfBothLock(cond1, cond2 bool) {
@@ -159,7 +159,7 @@ func (c *conditionalLock) nestedIfBothLock(cond1, cond2 bool) {
 		}
 		c.mu.Unlock()
 	}
-	c.data++ // want `mu is not held while accessing data`
+	c.data++ // want `writing 'c\.data' requires holding 'c\.mu'`
 }
 
 // ============================================================================
@@ -173,13 +173,13 @@ func (c *conditionalLock) lockInSomeCase(v int) {
 		c.data++ // OK
 		c.mu.Unlock()
 	case 2:
-		c.data++ // want `mu is not held while accessing data`
+		c.data++ // want `writing 'c\.data' requires holding 'c\.mu'`
 	case 3:
 		c.mu.Lock()
 		c.data++ // OK
 		c.mu.Unlock()
 	}
-	c.data++ // want `mu is not held while accessing data`
+	c.data++ // want `writing 'c\.data' requires holding 'c\.mu'`
 }
 
 func (c *conditionalLock) lockInOneCaseNoUnlock(v int) {
@@ -188,10 +188,10 @@ func (c *conditionalLock) lockInOneCaseNoUnlock(v int) {
 		c.mu.Lock()
 		c.data++ // OK
 	case 2:
-		c.data++ // want `mu is not held while accessing data`
+		c.data++ // want `writing 'c\.data' requires holding 'c\.mu'`
 	}
 	// Lock is POSSIBLY held
-	c.data++ // want `mu is possibly not held while accessing data`
+	c.data++ // want `writing 'c\.data' requires holding 'c\.mu' \(not held on all paths\)`
 }
 
 func (c *conditionalLock) lockInAllCases(v int) {
@@ -231,7 +231,7 @@ func (c *conditionalLock) lockInsideLoop() {
 		c.data++ // OK
 		c.mu.Unlock()
 	}
-	c.data++ // want `mu is not held while accessing data`
+	c.data++ // want `writing 'c\.data' requires holding 'c\.mu'`
 }
 
 func (c *conditionalLock) lockOutsideLoop() {
@@ -247,9 +247,9 @@ func (c *conditionalLock) lockInLoopCondition(cond bool) {
 		if cond {
 			c.mu.Lock()
 		}
-		c.data++ // want `mu is possibly not held while accessing data`
+		c.data++ // want `writing 'c\.data' requires holding 'c\.mu' \(not held on all paths\)`
 		if cond {
-			c.mu.Unlock() // want `unlocking a possibly non-locked lock`
+			c.mu.Unlock() // want `releasing 'mu' that may not be held`
 		}
 	}
 }
@@ -287,14 +287,14 @@ func (t *twoLocks) conditionalTwoLocks(cond1, cond2 bool) {
 	}
 
 	// mu1 possibly held, mu2 possibly held
-	t.a++ // want `mu1 is possibly not held while accessing a`
-	t.b++ // want `mu2 is possibly not held while accessing b`
+	t.a++ // want `writing 't\.a' requires holding 't\.mu1' \(not held on all paths\)`
+	t.b++ // want `writing 't\.b' requires holding 't\.mu2' \(not held on all paths\)`
 
 	if cond1 {
-		t.mu1.Unlock() // want `unlocking a possibly non-locked lock`
+		t.mu1.Unlock() // want `releasing 'mu1' that may not be held`
 	}
 	if cond2 {
-		t.mu2.Unlock() // want `unlocking a possibly non-locked lock`
+		t.mu2.Unlock() // want `releasing 'mu2' that may not be held`
 	}
 }
 
@@ -317,7 +317,7 @@ func (c *conditionalLock) earlyReturnConditional(cond1, cond2 bool) {
 		return
 	}
 
-	c.data++ // want `mu is not held while accessing data`
+	c.data++ // want `writing 'c\.data' requires holding 'c\.mu'`
 }
 
 func (c *conditionalLock) lockBeforeEarlyReturn(cond bool) {
@@ -344,7 +344,7 @@ func (c *conditionalLock) deferConditionalLock(cond bool) {
 		c.data++ // OK
 	}
 
-	c.data++ // want `mu is possibly not held while accessing data`
+	c.data++ // want `writing 'c\.data' requires holding 'c\.mu' \(not held on all paths\)`
 }
 
 func (c *conditionalLock) conditionalDefer(cond bool) {
@@ -375,7 +375,7 @@ func (c *conditionalLock) complexFlow(a, b, cond bool) {
 	}
 
 	// Lock is POSSIBLY held (some paths acquire it)
-	c.data++ // want `mu is possibly not held while accessing data`
+	c.data++ // want `writing 'c\.data' requires holding 'c\.mu' \(not held on all paths\)`
 }
 
 func (c *conditionalLock) switchInIf(v int, cond bool) {
@@ -394,7 +394,7 @@ func (c *conditionalLock) switchInIf(v int, cond bool) {
 	}
 
 	// Outside if: lock not held
-	c.data++ // want `mu is not held while accessing data`
+	c.data++ // want `writing 'c\.data' requires holding 'c\.mu'`
 }
 
 // ============================================================================
@@ -411,7 +411,7 @@ func (c *conditionalLock) loopWithConditionalBreak(cond bool) {
 		}
 	}
 	// Lock is POSSIBLY held (released if break was taken)
-	c.data++ // want `mu is possibly not held while accessing data`
+	c.data++ // want `writing 'c\.data' requires holding 'c\.mu' \(not held on all paths\)`
 }
 
 func (c *conditionalLock) loopWithConditionalContinue(cond bool) {
@@ -421,7 +421,7 @@ func (c *conditionalLock) loopWithConditionalContinue(cond bool) {
 			c.data++ // OK
 			continue
 		}
-		c.data++ // want `mu is not held while accessing data`
+		c.data++ // want `writing 'c\.data' requires holding 'c\.mu'`
 	}
 }
 
@@ -443,10 +443,10 @@ func (s *selectLock) selectWithLockInCase() {
 		s.data++ // OK
 		s.mu.Unlock()
 	case <-s.ch2:
-		s.data++ // want `mu is not held while accessing data`
+		s.data++ // want `writing 's\.data' requires holding 's\.mu'`
 	}
 
-	s.data++ // want `mu is not held while accessing data`
+	s.data++ // want `writing 's\.data' requires holding 's\.mu'`
 }
 
 func (s *selectLock) selectWithLockInAllCases() {
@@ -479,11 +479,11 @@ func (c *conditionalLock) flagPattern(cond bool) {
 	}
 
 	if locked {
-		c.data++ // want `mu is possibly not held while accessing data`
+		c.data++ // want `writing 'c\.data' requires holding 'c\.mu' \(not held on all paths\)`
 		// Tool can't track the boolean flag correlation
 	}
 
 	if locked {
-		c.mu.Unlock() // want `unlocking a possibly non-locked lock`
+		c.mu.Unlock() // want `releasing 'mu' that may not be held`
 	}
 }

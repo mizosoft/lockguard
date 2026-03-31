@@ -19,7 +19,7 @@ func (r *rw) multipleRLocks() {
 	_ = r.readers // OK (still one RLock held)
 	r.mu.RUnlock()
 
-	_ = r.readers // want `mu is not held while accessing readers`
+	_ = r.readers // want `reading 'r\.readers' requires holding 'r\.mu'`
 }
 
 func (r *rw) upgradeLockPattern() {
@@ -36,8 +36,8 @@ func (r *rw) upgradeLockPattern() {
 func (r *rw) mixedAccess() {
 	r.mu.RLock()
 	_ = r.readers // OK
-	r.writers++   // want `mu is not held while accessing writers`
-	r.auto++      // want `mu is not held while accessing auto`
+	r.writers++   // want `writing 'r\.writers' requires holding 'r\.mu'`
+	r.auto++      // want `writing 'r\.auto' requires holding 'r\.mu'`
 	r.mu.RUnlock()
 }
 
@@ -49,19 +49,19 @@ type rwLevels struct {
 }
 
 func (s *rwLevels) readWriteLockUnlock() {
-	s.auto_rw++   // want `mut is not held while accessing auto_rw`
-	_ = s.auto_rw // want `mut is not held while accessing auto_rw`
-	s.r++         // want `mut is not held while accessing r`
-	_ = s.r       // want `mut is not held while accessing r`
-	s.w++         // want `mut is not held while accessing w`
-	_ = s.w       // want `mut is not held while accessing w`
+	s.auto_rw++   // want `writing 's\.auto_rw' requires holding 's\.mut'`
+	_ = s.auto_rw // want `reading 's\.auto_rw' requires holding 's\.mut'`
+	s.r++         // want `writing 's\.r' requires holding 's\.mut'`
+	_ = s.r       // want `reading 's\.r' requires holding 's\.mut'`
+	s.w++         // want `writing 's\.w' requires holding 's\.mut'`
+	_ = s.w       // want `reading 's\.w' requires holding 's\.mut'`
 
 	s.mut.RLock()
 	_ = s.auto_rw
 	s.mut.RUnlock()
 
 	s.mut.RLock()
-	s.auto_rw++ // want `mut is not held while accessing auto_rw`
+	s.auto_rw++ // want `writing 's\.auto_rw' requires holding 's\.mut'`
 	s.mut.RUnlock()
 
 	s.mut.Lock()
@@ -77,7 +77,7 @@ func (s *rwLevels) readWriteLockUnlock() {
 	s.mut.Unlock()
 
 	s.mut.RLock()
-	s.w++ // want `mut is not held while accessing w`
+	s.w++ // want `writing 's\.w' requires holding 's\.mut'`
 	s.mut.RUnlock()
 
 	s.mut.Lock()

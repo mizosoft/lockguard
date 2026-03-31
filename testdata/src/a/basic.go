@@ -17,28 +17,28 @@ func (s *S1) mutFunc() *sync.Mutex {
 
 func lockUnlock() {
 	var s1 S1
-	s1.i++ // want `mut is not held while accessing i`
+	s1.i++ // want `writing 's1\.i' requires holding 's1\.mut'`
 
 	s1.mut.Lock()
 	s1.i++
 	s1.mut.Unlock()
 
-	s1.i++ // want `mut is not held while accessing i`
+	s1.i++ // want `writing 's1\.i' requires holding 's1\.mut'`
 }
 
 func (s *S1) methodLockUnlock() {
-	s.i++ // want `mut is not held while accessing i`
+	s.i++ // want `writing 's\.i' requires holding 's\.mut'`
 
 	s.mut.Lock()
 	s.i++
 	s.mut.Unlock()
 
-	s.i++ // want `mut is not held while accessing i`
+	s.i++ // want `writing 's\.i' requires holding 's\.mut'`
 }
 
 func lockDeferredUnlock() {
 	var s1 S1
-	s1.i++ // want `mut is not held while accessing i`
+	s1.i++ // want `writing 's1\.i' requires holding 's1\.mut'`
 
 	s1.mut.Lock()
 	defer s1.mut.Unlock()
@@ -46,7 +46,7 @@ func lockDeferredUnlock() {
 }
 
 func (s *S1) methodLockUnlockDeferred() {
-	s.i++ // want `mut is not held while accessing i`
+	s.i++ // want `writing 's\.i' requires holding 's\.mut'`
 
 	s.mut.Lock()
 	defer s.mut.Unlock()
@@ -66,7 +66,7 @@ func funcLiteralAcquiresNewScope() {
 	var s1 S1
 	s1.mut.Lock()
 	fn := func() {
-		s1.i++ // want `mut is not held while accessing i`
+		s1.i++ // want `writing 's1\.i' requires holding 's1\.mut'`
 
 		s1.mut.Lock()
 		s1.i++
@@ -79,7 +79,7 @@ func funcLiteralAcquiresNewScope() {
 func (s *S1) methodFuncLiteralAcquiresNewScope() {
 	s.mut.Lock()
 	fn := func() {
-		s.i++ // want `mut is not held while accessing i`
+		s.i++ // want `writing 's\.i' requires holding 's\.mut'`
 
 		s.mut.Lock()
 		s.i++
@@ -117,32 +117,32 @@ func (s *S2) s1Func() *S1 {
 
 func nestedLockUnlock() {
 	var s2 S2
-	s2.s1.i++ // want `mut is not held while accessing i`
+	s2.s1.i++ // want `writing 's2\.s1\.i' requires holding 's2\.s1\.mut'`
 
 	s2.s1.mut.Lock()
 	s2.s1.i++
 	s2.s1.mut.Unlock()
 
-	s2.s1.i++ // want `mut is not held while accessing i`
+	s2.s1.i++ // want `writing 's2\.s1\.i' requires holding 's2\.s1\.mut'`
 }
 
 func (s *S2) methodNestedLockUnlock() {
-	s.s1.i++ // want `mut is not held while accessing i`
-	s.k++    // want `mut is not held while accessing k`
+	s.s1.i++ // want `writing 's\.s1\.i' requires holding 's\.s1\.mut'`
+	s.k++    // want `writing 's\.k' requires holding 's\.s1\.mut'`
 
 	s.s1.mut.Lock()
 	s.s1.i++
 	s.k++
 	s.s1.mut.Unlock()
 
-	s.s1.i++ // want `mut is not held while accessing i`
-	s.k++    // want `mut is not held while accessing k`
+	s.s1.i++ // want `writing 's\.s1\.i' requires holding 's\.s1\.mut'`
+	s.k++    // want `writing 's\.k' requires holding 's\.s1\.mut'`
 }
 
 func nestedLockUnlockDeferred() {
 	var s2 S2
-	s2.s1.i++ // want `mut is not held while accessing i`
-	s2.k++    // want `mut is not held while accessing k`
+	s2.s1.i++ // want `writing 's2\.s1\.i' requires holding 's2\.s1\.mut'`
+	s2.k++    // want `writing 's2\.k' requires holding 's2\.s1\.mut'`
 
 	s2.s1.mut.Lock()
 	defer s2.s1.mut.Unlock()
@@ -151,8 +151,8 @@ func nestedLockUnlockDeferred() {
 }
 
 func (s *S2) methodNestedLockUnlockDeferred() {
-	s.s1.i++ // want `mut is not held while accessing i`
-	s.k++    // want `mut is not held while accessing k`
+	s.s1.i++ // want `writing 's\.s1\.i' requires holding 's\.s1\.mut'`
+	s.k++    // want `writing 's\.k' requires holding 's\.s1\.mut'`
 
 	s.s1.mut.Lock()
 	defer s.s1.mut.Unlock()
@@ -167,9 +167,9 @@ func lockUnlockWithScopes() {
 			switch 1 {
 			case 1:
 				if 1 < 2 {
-					for s2.s1.i > 0 { // want `mut is not held while accessing i`
-						if s2.s1.i == 5 { // want `mut is not held while accessing i`
-						} else if s2.k > 1 { // want `mut is not held while accessing k`
+					for s2.s1.i > 0 { // want `reading 's2\.s1\.i' requires holding 's2\.s1\.mut'`
+						if s2.s1.i == 5 { // want `reading 's2\.s1\.i' requires holding 's2\.s1\.mut'`
+						} else if s2.k > 1 { // want `reading 's2\.k' requires holding 's2\.s1\.mut'`
 						}
 					}
 
@@ -192,8 +192,8 @@ func lockUnlockWithScopes() {
 
 								// This function loses lock scope.
 								fn := func() {
-									s2.s1.i++ // want `mut is not held while accessing i`
-									s2.k++    // want `mut is not held while accessing k`
+									s2.s1.i++ // want `writing 's2\.s1\.i' requires holding 's2\.s1\.mut'`
+									s2.k++    // want `writing 's2\.k' requires holding 's2\.s1\.mut'`
 
 									fn2 := func() {
 										s2.s1.mut.Lock()
@@ -214,12 +214,12 @@ func lockUnlockWithScopes() {
 					s2.s1.mut.Unlock()
 				}
 
-				s2.s1.i++ // want `mut is not held while accessing i`
-				s2.k++    // want `mut is not held while accessing k`
+				s2.s1.i++ // want `writing 's2\.s1\.i' requires holding 's2\.s1\.mut'`
+				s2.k++    // want `writing 's2\.k' requires holding 's2\.s1\.mut'`
 			}
 		}
-		s2.s1.i++ // want `mut is not held while accessing i`
-		s2.k++    // want `mut is not held while accessing k`
+		s2.s1.i++ // want `writing 's2\.s1\.i' requires holding 's2\.s1\.mut'`
+		s2.k++    // want `writing 's2\.k' requires holding 's2\.s1\.mut'`
 	}
 }
 
@@ -229,10 +229,10 @@ func (s *S2) methodLockUnlockWithScopes() {
 			switch 1 {
 			case 1:
 				if 1 < 2 {
-					for s.k <= 10 { // want `mut is not held while accessing k`
-						if s.s1.i > 0 { // want `mut is not held while accessing i`
-						} else if s.k > 0 { // want `mut is not held while accessing k`
-							s.k++ // want `mut is not held while accessing k`
+					for s.k <= 10 { // want `reading 's\.k' requires holding 's\.s1\.mut'`
+						if s.s1.i > 0 { // want `reading 's\.s1\.i' requires holding 's\.s1\.mut'`
+						} else if s.k > 0 { // want `reading 's\.k' requires holding 's\.s1\.mut'`
+							s.k++ // want `writing 's\.k' requires holding 's\.s1\.mut'`
 						}
 					}
 
@@ -247,12 +247,12 @@ func (s *S2) methodLockUnlockWithScopes() {
 					s.s1.mut.Unlock()
 				}
 
-				s.s1.i++ // want `mut is not held while accessing i`
-				s.k++    // want `mut is not held while accessing k`
+				s.s1.i++ // want `writing 's\.s1\.i' requires holding 's\.s1\.mut'`
+				s.k++    // want `writing 's\.k' requires holding 's\.s1\.mut'`
 			}
 		}
-		s.s1.i++ // want `mut is not held while accessing i`
-		s.k++    // want `mut is not held while accessing k`
+		s.s1.i++ // want `writing 's\.s1\.i' requires holding 's\.s1\.mut'`
+		s.k++    // want `writing 's\.k' requires holding 's\.s1\.mut'`
 	}
 }
 
@@ -261,28 +261,28 @@ func (s *S1) f1() {}
 
 func funcLockUnlock() {
 	var s1 S1
-	s1.f1() // want `mut is not held while accessing f`
+	s1.f1() // want `reading 's1\.f1' requires holding 's1\.mut'`
 
 	s1.mut.Lock()
 	s1.f1()
 	s1.mut.Unlock()
 
-	s1.f1() // want `mut is not held while accessing f`
+	s1.f1() // want `reading 's1\.f1' requires holding 's1\.mut'`
 }
 
 func (s *S1) methodFuncLockUnlock() {
-	s.f1() // want `mut is not held while accessing f`
+	s.f1() // want `reading 's\.f1' requires holding 's\.mut'`
 
 	s.mut.Lock()
 	s.f1()
 	s.mut.Unlock()
 
-	s.f1() // want `mut is not held while accessing f`
+	s.f1() // want `reading 's\.f1' requires holding 's\.mut'`
 }
 
 func funcLockDeferredUnlock() {
 	var s1 S1
-	s1.f1() // want `mut is not held while accessing f`
+	s1.f1() // want `reading 's1\.f1' requires holding 's1\.mut'`
 
 	s1.mut.Lock()
 	defer s1.mut.Unlock()
@@ -290,7 +290,7 @@ func funcLockDeferredUnlock() {
 }
 
 func (s *S1) methodFuncLockUnlockDeferred() {
-	s.f1() // want `mut is not held while accessing f`
+	s.f1() // want `reading 's\.f1' requires holding 's\.mut'`
 
 	s.mut.Lock()
 	defer s.mut.Unlock()
@@ -331,7 +331,7 @@ func (s *S3) s2Func() *S2 {
 }
 
 func (s *S3) lockDeferredUnlockWithFuncExpr() {
-	s.j++ // want `mutFunc is not held while accessing j`
+	s.j++ // want `writing 's\.j' requires holding 's\.s2\.s1Func\.mutFunc'`
 
 	s.s2.s1Func().mutFunc().Lock()
 	defer s.s2.s1Func().mutFunc().Unlock()
@@ -345,7 +345,7 @@ type S4 struct {
 }
 
 func (s *S4) lockDeferredUnlockWithFuncExpr2() {
-	s.r++ // want `mut is not held while accessing r`
+	s.r++ // want `writing 's\.r' requires holding 's\.s3\.s2Func\.s1Func\.mut'`
 
 	s.s3.s2Func().s1Func().mut.Lock()
 	defer s.s3.s2Func().s1Func().mut.Unlock()
@@ -359,7 +359,7 @@ type S6 struct {
 }
 
 func (s *S6) lockUnlockEmbeddedField() {
-	s.i++ // want `Mutex is not held while accessing i`
+	s.i++ // want `writing 's\.i' requires holding 's\.Mutex'`
 
 	s.Mutex.Lock()
 	s.i++
@@ -376,7 +376,7 @@ type S7 struct {
 }
 
 func (s *S7) lockUnlockEmbeddedField() {
-	s.i++ // want `Mutex is not held while accessing i`
+	s.i++ // want `writing 's\.i' requires holding 's\.s6\.Mutex'`
 
 	s.s6.Lock()
 	s.i++
@@ -409,11 +409,11 @@ type S9 struct {
 }
 
 func (s *S9) hiddenProtectedField() {
-	s.i++ // want `mu is not held while accessing Inner` `Mutex is not held while accessing i`
+	s.i++ // want `writing 's\.Inner' requires holding 's\.mu'` `writing 's\.Inner\.i' requires holding 's\.Inner\.Mutex'`
 
-	s.Lock()   // want `mu is not held while accessing Inner`
-	s.i++      // want `mu is not held while accessing Inner`
-	s.Unlock() // want `mu is not held while accessing Inner`
+	s.Lock()   // want `reading 's\.Inner' requires holding 's\.mu'`
+	s.i++      // want `writing 's\.Inner' requires holding 's\.mu'`
+	s.Unlock() // want `reading 's\.Inner' requires holding 's\.mu'`
 
 	s.mu.Lock()
 	s.Lock()

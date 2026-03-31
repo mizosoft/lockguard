@@ -1,4 +1,4 @@
-package lockgaurd
+package lockguard
 
 import (
 	"go/ast"

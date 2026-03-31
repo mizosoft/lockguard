@@ -18,9 +18,9 @@ type level1 struct {
 }
 
 func (l *level1) deepNesting() {
-	l.z++       // want `mu is not held while accessing z`
-	l.l2.y++    // want `mu is not held while accessing y`
-	l.l2.l3.x++ // want `mu is not held while accessing x`
+	l.z++       // want `writing 'l\.z' requires holding 'l\.l2\.l3\.mu'`
+	l.l2.y++    // want `writing 'l\.l2\.y' requires holding 'l\.l2\.l3\.mu'`
+	l.l2.l3.x++ // want `writing 'l\.l2\.l3\.x' requires holding 'l\.l2\.l3\.mu'`
 
 	l.l2.l3.mu.Lock()
 	l.z++       // OK

@@ -16,7 +16,7 @@ type atomicTest struct {
 
 func (a *atomicTest) atomicAccess() {
 	// Tool should still warn even though atomic operations are safe
-	atomic.AddInt64(&a.counter, 1) // want `mu is not held while accessing counter`
+	atomic.AddInt64(&a.counter, 1) // want `reading 'a\.counter' requires holding 'a\.mu'`
 
 	a.mu.Lock()
 	atomic.AddInt64(&a.counter, 1) // OK
@@ -33,13 +33,13 @@ type comparable struct {
 }
 
 func (c *comparable) compare(other *comparable) bool {
-	return c.x == other.x // want `mu is not held while accessing x` `mu is not held while accessing x`
+	return c.x == other.x // want `reading 'c\.x' requires holding 'c\.mu'` `reading 'other\.x' requires holding 'other\.mu'`
 }
 
 func (c *comparable) compareHalfSafe(other *comparable) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.x == other.x // want `mu is not held while accessing x`
+	return c.x == other.x // want `reading 'other\.x' requires holding 'other\.mu'`
 }
 
 func (c *comparable) safeCompare(other *comparable) bool {
@@ -60,7 +60,7 @@ type pointerFields struct {
 }
 
 func (p *pointerFields) dereferenceProtected() {
-	*p.ptr = 42 // want `mu is not held while accessing ptr`
+	*p.ptr = 42 // want `writing 'p\.ptr' requires holding 'p\.mu'`
 
 	p.mu.Lock()
 	*p.ptr = 42 // OK
@@ -69,7 +69,7 @@ func (p *pointerFields) dereferenceProtected() {
 
 func (p *pointerFields) reassignProtected() {
 	newVal := 100
-	p.ptr = &newVal // want `mu is not held while accessing ptr`
+	p.ptr = &newVal // want `writing 'p\.ptr' requires holding 'p\.mu'`
 
 	p.mu.Lock()
 	p.ptr = &newVal // OK
@@ -86,7 +86,7 @@ type typeAssertions struct {
 }
 
 func (t *typeAssertions) typeAssert() {
-	_ = t.iface.(int) // want `mu is not held while accessing iface`
+	_ = t.iface.(int) // want `reading 't\.iface' requires holding 't\.mu'`
 
 	t.mu.Lock()
 	_ = t.iface.(int) // OK
@@ -94,7 +94,7 @@ func (t *typeAssertions) typeAssert() {
 }
 
 func (t *typeAssertions) typeSwitch() {
-	switch t.iface.(type) { // want `mu is not held while accessing iface`
+	switch t.iface.(type) { // want `reading 't\.iface' requires holding 't\.mu'`
 	case int:
 	case string:
 	}
@@ -125,7 +125,7 @@ func sum(vals ...int) int {
 }
 
 func (v *variadicTest) passToVariadic() {
-	_ = sum(v.values...) // want `mu is not held while accessing values`
+	_ = sum(v.values...) // want `reading 'v\.values' requires holding 'v\.mu'`
 
 	v.mu.Lock()
 	_ = sum(v.values...) // OK
@@ -143,13 +143,13 @@ type closureTest struct {
 
 func (c *closureTest) closureCapture() {
 	fn := func() int {
-		return c.x // want `mu is not held while accessing x`
+		return c.x // want `reading 'c\.x' requires holding 'c\.mu'`
 	}
 	_ = fn()
 
 	c.mu.Lock()
 	fn2 := func() int {
-		return c.x // want `mu is not held while accessing x`
+		return c.x // want `reading 'c\.x' requires holding 'c\.mu'`
 	}
 	c.mu.Unlock()
 
@@ -193,8 +193,8 @@ type MultiBase struct {
 }
 
 func (m *MultiBase) ambiguousAccess() {
-	m.y++ // want `mu is not held while accessing y`
-	m.z++ // want `mu is not held while accessing z`
+	m.y++ // want `writing 'm\.y' requires holding 'm\.Base1\.mu'`
+	m.z++ // want `writing 'm\.z' requires holding 'm\.Base2\.mu'`
 
 	// Can't access m.x or m.mu due to ambiguity
 	// m.x++ // This would be a compile error
@@ -202,7 +202,7 @@ func (m *MultiBase) ambiguousAccess() {
 	m.Base1.mu.Lock()
 	m.Base1.x++ // OK
 	m.y++       // OK
-	m.z++       // want `mu is not held while accessing z`
+	m.z++       // want `writing 'm\.z' requires holding 'm\.Base2\.mu'`
 	m.Base1.mu.Unlock()
 }
 
@@ -216,7 +216,7 @@ type constFields struct {
 }
 
 func (c *constFields) readImmutable() {
-	_ = c.immutable // want `mu is not held while accessing immutable`
+	_ = c.immutable // want `reading 'c\.immutable' requires holding 'c\.mu'`
 }
 
 // ============================================================================
@@ -229,7 +229,7 @@ type blankTest struct {
 }
 
 func (b *blankTest) blankAssignment() {
-	_, _ = b.x, b.y // want `mu is not held while accessing x` `mu is not held while accessing y`
+	_, _ = b.x, b.y // want `reading 'b\.x' requires holding 'b\.mu'` `reading 'b\.y' requires holding 'b\.mu'`
 
 	b.mu.Lock()
 	_, _ = b.x, b.y // OK
@@ -251,7 +251,7 @@ func (m *methodValue) protectedMethod() {
 }
 
 func (m *methodValue) methodAsValue() {
-	fn := m.protectedMethod // want `mu is not held while accessing protectedMethod`
+	fn := m.protectedMethod // want `reading 'm\.protectedMethod' requires holding 'm\.mu'`
 
 	m.mu.Lock()
 	fn = m.protectedMethod
@@ -285,7 +285,7 @@ func (r *recursiveTest) recursiveNoLock(n int) {
 		return
 	}
 
-	r.depth++ // want `mu is not held while accessing depth`
+	r.depth++ // want `writing 'r\.depth' requires holding 'r\.mu'`
 	r.recursiveNoLock(n - 1)
 }
 
@@ -303,7 +303,7 @@ outer:
 	for i := 0; i < 10; i++ {
 		for j := 0; j < 10; j++ {
 			if j == 5 {
-				l.x++ // want `mu is not held while accessing x`
+				l.x++ // want `writing 'l\.x' requires holding 'l\.mu'`
 				break outer
 			}
 		}
@@ -373,8 +373,8 @@ type typeConversion struct {
 }
 
 func (t *typeConversion) convert() {
-	_ = int(t.y)         // want `mu is not held while accessing y`
-	_ = aliasedType(t.x) // want `mu is not held while accessing x`
+	_ = int(t.y)         // want `reading 't\.y' requires holding 't\.mu'`
+	_ = aliasedType(t.x) // want `reading 't\.x' requires holding 't\.mu'`
 
 	t.mu.Lock()
 	_ = int(t.y)         // OK
@@ -393,9 +393,9 @@ type unaryTest struct {
 }
 
 func (u *unaryTest) unaryOps() {
-	_ = -u.x // want `mu is not held while accessing x`
-	_ = +u.x // want `mu is not held while accessing x`
-	_ = !u.b // want `mu is not held while accessing b`
+	_ = -u.x // want `reading 'u\.x' requires holding 'u\.mu'`
+	_ = +u.x // want `reading 'u\.x' requires holding 'u\.mu'`
+	_ = !u.b // want `reading 'u\.b' requires holding 'u\.mu'`
 
 	u.mu.Lock()
 	_ = -u.x // OK
@@ -422,7 +422,7 @@ type hasMethodStruct struct {
 }
 
 func (h *hasMethodStruct) callProtectedMethod() {
-	_ = h.ms.doSomething() // want `mu is not held while accessing ms`
+	_ = h.ms.doSomething() // want `reading 'h\.ms' requires holding 'h\.mu'`
 
 	h.mu.Lock()
 	_ = h.ms.doSomething() // OK
@@ -440,7 +440,7 @@ var globalProtected struct {
 
 func init() {
 	// During init, no concurrency exists yet
-	globalProtected.x = 42 // want `mu is not held while accessing x`
+	globalProtected.x = 42 // want `writing 'globalProtected\.x' requires holding 'globalProtected\.mu'`
 }
 
 // ============================================================================
@@ -453,7 +453,7 @@ type stringTest struct {
 }
 
 func (s *stringTest) concat() {
-	_ = "Hello " + s.name // want `mu is not held while accessing name`
+	_ = "Hello " + s.name // want `reading 's\.name' requires holding 's\.mu'`
 
 	s.mu.Lock()
 	_ = "Hello " + s.name // OK
@@ -474,7 +474,7 @@ type literalOuter struct {
 }
 
 func (l *literalOuter) structLiteral() {
-	l.inner = literalInner{x: 42} // want `mu is not held while accessing inner`
+	l.inner = literalInner{x: 42} // want `writing 'l\.inner' requires holding 'l\.mu'`
 
 	l.mu.Lock()
 	l.inner = literalInner{x: 42} // OK
@@ -493,12 +493,12 @@ type builtinTest struct {
 }
 
 func (b *builtinTest) builtinFunctions() {
-	_ = len(b.slice) // want `mu is not held while accessing slice`
-	_ = cap(b.slice) // want `mu is not held while accessing slice`
-	_ = len(b.m)     // want `mu is not held while accessing m`
-	_ = len(b.ch)    // want `mu is not held while accessing ch`
-	_ = cap(b.ch)    // want `mu is not held while accessing ch`
-	close(b.ch)      // want `mu is not held while accessing ch`
+	_ = len(b.slice) // want `reading 'b\.slice' requires holding 'b\.mu'`
+	_ = cap(b.slice) // want `reading 'b\.slice' requires holding 'b\.mu'`
+	_ = len(b.m)     // want `reading 'b\.m' requires holding 'b\.mu'`
+	_ = len(b.ch)    // want `reading 'b\.ch' requires holding 'b\.mu'`
+	_ = cap(b.ch)    // want `reading 'b\.ch' requires holding 'b\.mu'`
+	close(b.ch)      // want `reading 'b\.ch' requires holding 'b\.mu'`
 
 	b.mu.Lock()
 	_ = len(b.slice) // OK

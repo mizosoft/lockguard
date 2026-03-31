@@ -19,11 +19,11 @@ func tryLockUnlockDeferred() {
 		defer s.mut.Unlock()
 		s.i++
 	} else {
-		s.i++ // want `mut is not held while accessing i`
+		s.i++ // want `writing 's\.i' requires holding 's\.mut'`
 	}
 
 	// defer s.mut.Unlock() has not applied yet, so the lock is possibly still held.
-	s.i++ // want `mut is possibly not held while accessing i`
+	s.i++ // want `writing 's\.i' requires holding 's\.mut' \(not held on all paths\)`
 }
 
 func tryLockUnlockInstantly() {
@@ -32,10 +32,10 @@ func tryLockUnlockInstantly() {
 		s.i++
 		s.mut.Unlock()
 	} else {
-		s.i++ // want `mut is not held while accessing i`
+		s.i++ // want `writing 's\.i' requires holding 's\.mut'`
 	}
 
-	s.i++ // want `mut is not held while accessing i`
+	s.i++ // want `writing 's\.i' requires holding 's\.mut'`
 }
 
 // TryLock with no else clause: lock is not held after the if because it was
@@ -46,7 +46,7 @@ func tryLockNoElse() {
 		s.i++
 		s.mut.Unlock()
 	}
-	s.i++ // want `mut is not held while accessing i`
+	s.i++ // want `writing 's\.i' requires holding 's\.mut'`
 }
 
 // TryLock with no else and no unlock: lock is possibly held after the if,
@@ -56,7 +56,7 @@ func tryLockNoElseNoUnlock() {
 	if s.mut.TryLock() {
 		s.i++
 	}
-	s.i++ // want `mut is possibly not held while accessing i`
+	s.i++ // want `writing 's\.i' requires holding 's\.mut' \(not held on all paths\)`
 }
 
 // ============================================================================
@@ -68,7 +68,7 @@ func tryLockNoElseNoUnlock() {
 func negatedTryLock() {
 	var s S
 	if !s.mut.TryLock() {
-		s.i++ // want `mut is not held while accessing i`
+		s.i++ // want `writing 's\.i' requires holding 's\.mut'`
 	} else {
 		defer s.mut.Unlock()
 		s.i++ // OK
@@ -91,9 +91,9 @@ func tryRLock() {
 		s.data++ // OK
 		s.mu.RUnlock()
 	} else {
-		s.data++ // want `mu is not held while accessing data`
+		s.data++ // want `writing 's\.data' requires holding 's\.mu'`
 	}
-	s.data++ // want `mu is not held while accessing data`
+	s.data++ // want `writing 's\.data' requires holding 's\.mu'`
 }
 
 // ============================================================================
@@ -118,8 +118,8 @@ func tryLockAnd() {
 		t.mu1.Unlock()
 		t.mu2.Unlock()
 	} else {
-		t.a++ // want `mu1 is possibly not held while accessing a`
-		t.b++ // want `mu2 is possibly not held while accessing b`
+		t.a++ // want `writing 't\.a' requires holding 't\.mu1' \(not held on all paths\)`
+		t.b++ // want `writing 't\.b' requires holding 't\.mu2' \(not held on all paths\)`
 	}
 }
 
@@ -128,11 +128,11 @@ func tryLockAnd() {
 func tryLockOr() {
 	var t Two
 	if t.mu1.TryLock() || t.mu2.TryLock() {
-		t.a++ // want `mu1 is possibly not held while accessing a`
-		t.b++ // want `mu2 is possibly not held while accessing b`
+		t.a++ // want `writing 't\.a' requires holding 't\.mu1' \(not held on all paths\)`
+		t.b++ // want `writing 't\.b' requires holding 't\.mu2' \(not held on all paths\)`
 	} else {
-		t.a++ // want `mu1 is not held while accessing a`
-		t.b++ // want `mu2 is not held while accessing b`
+		t.a++ // want `writing 't\.a' requires holding 't\.mu1'`
+		t.b++ // want `writing 't\.b' requires holding 't\.mu2'`
 	}
 }
 
@@ -140,11 +140,55 @@ func tryLockOr() {
 // Deadlock detection
 // ============================================================================
 
+// ============================================================================
+// Early-return TryLock guard pattern
+// ============================================================================
+
+// The canonical guard pattern: if TryLock fails, return immediately.
+// After the if, TryLock must have succeeded, so the lock is definitely held.
+func earlyReturnGuard() {
+	var s S
+	if !s.mut.TryLock() {
+		return
+	}
+	s.i++          // want `writing 's\.i' requires holding 's\.mut'`
+	s.mut.Unlock() // want `releasing 'mut' that is not held`
+}
+
+// Same pattern but with deferred unlock.
+func earlyReturnGuardDeferred() {
+	var s S
+	if !s.mut.TryLock() {
+		return
+	}
+	defer s.mut.Unlock()
+	s.i++ // want `writing 's\.i' requires holding 's\.mut'`
+}
+
+// The non-negated form: the else branch is the success path.
+// (This is already handled via KindIfElse and is tested above in negatedTryLock.)
+
+// Chained guard: two locks both acquired via early-return guards.
+func earlyReturnGuardTwoLocks() {
+	var t Two
+	if !t.mu1.TryLock() {
+		return
+	}
+	if !t.mu2.TryLock() {
+		t.mu1.Unlock() // want `releasing 'mu1' that is not held`
+		return
+	}
+	t.a++          // want `writing 't\.a' requires holding 't\.mu1'`
+	t.b++          // want `writing 't\.b' requires holding 't\.mu2'`
+	t.mu1.Unlock() // want `releasing 'mu1' that is not held`
+	t.mu2.Unlock() // want `releasing 'mu2' that is not held`
+}
+
 // TryLocking a lock that is already held is a deadlock.
 func doubleTryLock() {
 	var s S
 	if s.mut.TryLock() {
-		if s.mut.TryLock() { // want `deadlock: mut - already locked`
+		if s.mut.TryLock() { // want `acquiring 'mut' that is already held \[deadlock\]`
 			s.mut.Unlock()
 		}
 		s.i++

@@ -14,7 +14,7 @@ type withMultipleLocks struct {
 func (m *withMultipleLocks) wrongLock() {
 	m.mu1.Lock()
 	m.a++ // OK
-	m.b++ // want `mu2 is not held while accessing b`
+	m.b++ // want `writing 'm\.b' requires holding 'm\.mu2'`
 	m.c++ // OK
 	m.mu1.Unlock()
 }
@@ -38,5 +38,5 @@ func (m *withMultipleLocks) lockOrdering() {
 	m.b++ // OK
 	m.mu2.Unlock()
 
-	m.a++ // want `mu1 is not held while accessing a`
+	m.a++ // want `writing 'm\.a' requires holding 'm\.mu1'`
 }

@@ -1,6 +1,6 @@
 # Lockguard
 
-A Go static analysis tool that enforces lock protection rules on struct fields, methods, and global variables and functions.
+A Go static analysis tool that enforces lock protection rules on struct fields, methods, global variables and functions.
 
 Lockguard complains when accesses to protected data (as defined by explicit protection rules) occur without the required lock(s) held, and flags common locking mistakes such as deadlocks and misaligned unlock calls.
 
@@ -100,38 +100,61 @@ Not all lock protection patterns are the same. To account for subtle variations 
 
 ## Diagnostics
 
+Diagnostic messages use the full dot-separated path to both the accessed field and the required lock, matching how you would write the expression in code (e.g. `s.data`, `s.mu`). For global variables there is no receiver prefix.
+
 ### Missing lock
 
 ```
-mut is not held while accessing i
+writing 's.data' requires holding 's.mu'
+reading 's.data' requires holding 's.mu'
 ```
 
-The field or function was accessed without the required lock held.
+The field or function was accessed without the required lock held. `writing` is used for assignments and increments; `reading` for all other accesses.
 
 ### Possibly missing lock
 
 ```
-mut is possibly not held while accessing i
+writing 's.data' requires holding 's.mu' (not held on all paths)
 ```
 
-Emitted when lockguard cannot determine statically whether the lock is held on all paths reaching this access (e.g. after a `TryLock` with no corresponding `Unlock` on all branches).
+The required lock is not held on every path reaching this access — for example, it was acquired only inside one branch of an `if` statement or after a `TryLock` that is not unlocked on all branches.
 
 ### Deadlock
 
 ```
-deadlock: mu - already locked
+acquiring 's.mu' that is already held [deadlock]
+acquiring 's.mu' that may be held [deadlock]
 ```
 
-A lock is acquired while it is already definitively held. For `sync.RWMutex`, acquiring a write lock while a read lock is already held also triggers this.
+A lock is acquired while it is already definitively held (`already`) or possibly held (`may be`) on the current path. For `sync.RWMutex`, acquiring a write lock while a read lock is held also triggers this.
 
-### Misaligned unlock
+### Possible deadlock
 
 ```
-mu - unlocking a non-locked lock
-mu - read-unlocking a non-locked lock
+acquiring 's.mu' that is already held [possible deadlock]
+acquiring 's.mu' that may be held [possible deadlock]
 ```
 
-An `Unlock` or `RUnlock` is called when the lock is not currently held.
+Same as deadlock, but emitted for `TryLock` / `TryRLock` acquisitions where the outcome is uncertain.
+
+### Invalid unlock
+
+```
+releasing 's.mu' that is not held
+releasing 's.mu' that may not be held
+releasing read lock on 's.mu' that is not held
+releasing read lock on 's.mu' that may not be held
+```
+
+`Unlock` or `RUnlock` is called when the lock is definitely not held (`is not held`) or only possibly held (`may not be held`).
+
+### Invalid annotation
+
+```
+expression doesn't locate a lock field mu
+```
+
+A struct tag or `//lockguard:` comment directive could not be parsed or resolved to a known lock object.
 
 ## TryLock support
 
@@ -142,10 +165,10 @@ if s.mu.TryLock() {
     s.data++        // OK: lock is held on the true branch
     s.mu.Unlock()
 } else {
-    s.data++        // diagnostic: mu is not held while accessing data
+    s.data++        // writing 's.data' requires holding 's.mu'
 }
 
-s.data++ // diagnostic: mu is not held while accessing data
+s.data++ // writing 's.data' requires holding 's.mu'
 ```
 
 Compound conditions are also handled:
@@ -171,8 +194,8 @@ type Cache struct {
 }
 
 func (c *Cache) Set(key, value string) {
-  // c.data[key] = value  // would be flagged: mu is not held
-  
+  // c.data[key] = value  // writing 'c.data' requires holding 'c.mu'
+
   // Must acquire write lock.
   c.mu.Lock()
   defer c.mu.Unlock()
@@ -180,7 +203,7 @@ func (c *Cache) Set(key, value string) {
 }
 
 func (c *Cache) Get(key string) string {
-  // return c.data[key]  // would be flagged: mu is not held
+  // return c.data[key]  // reading 'c.data' requires holding 'c.mu'
 
   // Can acquire read lock.
   c.mu.RLock()
@@ -198,7 +221,7 @@ func (s *Server) lockedHelper() {
 }
 
 func (s *Server) PublicMethod() {
-    s.lockedHelper()  // flagged: mu is not held while accessing lockedHelper
+    s.lockedHelper()  // reading 's.lockedHelper' requires holding 's.mu'
 
     s.mu.Lock()
     defer s.mu.Unlock()
@@ -220,11 +243,10 @@ var sharedData int
 
 | Flag | Default | Description |
 |---|---|---|
-| `-lockguard.debug` | `false` | Print internal CFG and lock-state debug output |
+| `-lockguard.verbose` | `false` | Print internal CFG and lock-state debug output |
 
 ## Known limitations
 
 - **Struct literals**: field accesses inside composite literals are not yet checked.
 - **Cross-package facts**: protection facts are exported for use by other packages, but importing facts from dependencies is not yet implemented.
 - **Back edges / loops**: lock state is not propagated around loop back edges, so patterns like `for { mu.Lock() }` are not analyzed across iterations.
-- **Early-return TryLock guard**: the pattern `if !mu.TryLock() { return }` does not yet inject lock state into the continuation block.

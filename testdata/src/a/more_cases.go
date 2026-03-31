@@ -13,19 +13,19 @@ func (c *controlFlow) ifElseBranches(cond bool) {
 		c.x++ // OK
 		c.mu.Unlock()
 	} else {
-		c.x++ // want `mu is not held while accessing x`
+		c.x++ // want `writing 'c\.x' requires holding 'c\.mu'`
 	}
 
-	c.x++ // want `mu is not held while accessing x`
+	c.x++ // want `writing 'c\.x' requires holding 'c\.mu'`
 }
 
 func (c *controlFlow) lockInBranch(cond bool) {
 	if cond {
 		c.mu.Lock()
 	}
-	c.x++ // want `mu is possibly not held while accessing x`
+	c.x++ // want `writing 'c\.x' requires holding 'c\.mu' \(not held on all paths\)`
 	if cond {
-		c.mu.Unlock() // want `unlocking a possibly non-locked lock`
+		c.mu.Unlock() // want `releasing 'mu' that may not be held`
 	}
 }
 
@@ -59,11 +59,11 @@ type switchTest struct {
 }
 
 func (s *switchTest) switchStmt() {
-	switch s.state { // want `mu is not held while accessing state`
+	switch s.state { // want `reading 's\.state' requires holding 's\.mu'`
 	case 1:
-		s.state++ // want `mu is not held while accessing state`
+		s.state++ // want `writing 's\.state' requires holding 's\.mu'`
 	case 2:
-		s.state++ // want `mu is not held while accessing state`
+		s.state++ // want `writing 's\.state' requires holding 's\.mu'`
 	}
 }
 
@@ -103,7 +103,7 @@ type loopTest struct {
 
 func (l *loopTest) forLoop() {
 	for i := 0; i < 10; i++ {
-		l.counter++ // want `mu is not held while accessing counter`
+		l.counter++ // want `writing 'l\.counter' requires holding 'l\.mu'`
 	}
 }
 
@@ -165,21 +165,21 @@ type multiEmbed struct {
 }
 
 func (m *multiEmbed) multipleEmbedded() {
-	m.a++ // want `muA is not held while accessing a`
-	m.b++ // want `muB is not held while accessing b`
-	m.c++ // want `muA is not held while accessing c`
-	m.d++ // want `muB is not held while accessing d`
+	m.a++ // want `writing 'm\.embedA\.a' requires holding 'm\.embedA\.muA'`
+	m.b++ // want `writing 'm\.embedB\.b' requires holding 'm\.embedB\.muB'`
+	m.c++ // want `writing 'm\.c' requires holding 'm\.embedA\.muA'`
+	m.d++ // want `writing 'm\.d' requires holding 'm\.embedB\.muB'`
 
 	m.muA.Lock()
 	m.a++ // OK
 	m.c++ // OK
-	m.b++ // want `muB is not held while accessing b`
+	m.b++ // want `writing 'm\.embedB\.b' requires holding 'm\.embedB\.muB'`
 	m.muA.Unlock()
 
 	m.muB.Lock()
 	m.b++ // OK
 	m.d++ // OK
-	m.a++ // want `muA is not held while accessing a`
+	m.a++ // want `writing 'm\.embedA\.a' requires holding 'm\.embedA\.muA'`
 	m.muB.Unlock()
 }
 
@@ -211,12 +211,12 @@ type ShadowOuter struct {
 func (s *ShadowOuter) shadowedLocks() {
 	s.mu.Lock() // Locks ShadowOuter.mu
 	s.y++       // OK
-	s.x++       // want `mu is not held while accessing x`
+	s.x++       // want `writing 's\.ShadowInner\.x' requires holding 's\.ShadowInner\.mu'`
 	s.mu.Unlock()
 
 	s.ShadowInner.mu.Lock() // Locks ShadowInner.mu explicitly
 	s.x++                   // OK
-	s.y++                   // want `mu is not held while accessing y`
+	s.y++                   // want `writing 's\.y' requires holding 's\.mu'`
 	s.ShadowInner.mu.Unlock()
 
 	// Lock both
@@ -272,10 +272,10 @@ type SelectTest struct {
 func (s *SelectTest) selectStmt() {
 	select {
 	case val := <-s.ch:
-		s.x = val // want `mu is not held while accessing x`
-	case s.ch <- s.x: // want `mu is not held while accessing x`
+		s.x = val // want `writing 's\.x' requires holding 's\.mu'`
+	case s.ch <- s.x: // want `reading 's\.x' requires holding 's\.mu'`
 	default:
-		s.x++ // want `mu is not held while accessing x`
+		s.x++ // want `writing 's\.x' requires holding 's\.mu'`
 	}
 }
 
@@ -318,8 +318,8 @@ type chainC struct {
 }
 
 func (c *chainC) chainedProtection() {
-	c.x++ // want `mu is not held while accessing x`
-	c.y++ // want `getMutex is not held while accessing y`
+	c.x++ // want `writing 'c\.x' requires holding 'c\.b\.a\.mu'`
+	c.y++ // want `writing 'c\.y' requires holding 'c\.b\.getA\.getMutex'`
 
 	c.b.a.mu.Lock()
 	c.x++ // OK
@@ -340,7 +340,7 @@ type valueTest struct {
 }
 
 func (v valueTest) valueReceiver() {
-	v.x++ // want `mu is not held while accessing x`
+	v.x++ // want `writing 'v\.x' requires holding 'v\.mu'`
 }
 
 func valueReceiverCaller() {
@@ -359,7 +359,7 @@ type unprotectedPatterns struct {
 
 func (u *unprotectedPatterns) initOnce() {
 	// Common pattern: write once before any reads
-	u.init = 42 // want `mu is not held while accessing init`
+	u.init = 42 // want `writing 'u\.init' requires holding 'u\.mu'`
 	// (Tool doesn't know about init-once)
 }
 
@@ -381,7 +381,7 @@ func (n *namedReturn) namedReturnValue() (result int) {
 }
 
 func (n *namedReturn) namedReturnNoLock() (result int) {
-	result = n.x // want `mu is not held while accessing x`
+	result = n.x // want `reading 'n\.x' requires holding 'n\.mu'`
 	return
 }
 
@@ -395,12 +395,12 @@ type assignOps struct {
 }
 
 func (a *assignOps) compoundAssignments() {
-	a.x += 1 // want `mu is not held while accessing x`
-	a.x -= 1 // want `mu is not held while accessing x`
-	a.x *= 2 // want `mu is not held while accessing x`
-	a.x /= 2 // want `mu is not held while accessing x`
-	a.x++    // want `mu is not held while accessing x`
-	a.x--    // want `mu is not held while accessing x`
+	a.x += 1 // want `writing 'a\.x' requires holding 'a\.mu'`
+	a.x -= 1 // want `writing 'a\.x' requires holding 'a\.mu'`
+	a.x *= 2 // want `writing 'a\.x' requires holding 'a\.mu'`
+	a.x /= 2 // want `writing 'a\.x' requires holding 'a\.mu'`
+	a.x++    // want `writing 'a\.x' requires holding 'a\.mu'`
+	a.x--    // want `writing 'a\.x' requires holding 'a\.mu'`
 
 	a.mu.Lock()
 	a.x += 1 // OK
@@ -422,7 +422,7 @@ type addressOf struct {
 }
 
 func (a *addressOf) takeAddress() {
-	ptr := &a.x // want `mu is not held while accessing x`
+	ptr := &a.x // want `reading 'a\.x' requires holding 'a\.mu'`
 	*ptr = 42   // Indirect access
 
 	a.mu.Lock()

@@ -1,4 +1,4 @@
-package lockgaurd
+package lockguard
 
 import (
 	"go/ast"
@@ -29,7 +29,7 @@ var Analyzer = &analysis.Analyzer{
 }
 
 func init() {
-	Analyzer.Flags.BoolVar(&debug, "debug", false, "enable debug output")
+	Analyzer.Flags.BoolVar(&debug, "verbose", false, "print internal CFG and lock-state debug output")
 }
 
 func run(pass *analysis.Pass) (interface{}, error) {
@@ -276,15 +276,11 @@ func (l *lockAnalyzer) analyzeCfg(block *ast.BlockStmt, entry *cfg.Block) {
 			for _, call := range calls {
 				switch call.state {
 				case trueTryLockState:
-					for _, w := range l.currentLockScope().lock(succ, call.path[:len(call.path)-1], call.isRLock) {
-						l.pass.Reportf(branchCond.Pos(), "%s", w)
-					}
+					reportAll(l.pass, branchCond.Pos(), l.currentLockScope().lock(succ, call.path[:len(call.path)-1], call.isRLock))
 				case falseTryLockState:
 					// Lock not acquired — nothing to apply.
 				case unknownTryLockState:
-					for _, w := range l.currentLockScope().possibleLock(succ, call.path[:len(call.path)-1], call.isRLock) {
-						l.pass.Reportf(branchCond.Pos(), "%s", w)
-					}
+					reportAll(l.pass, branchCond.Pos(), l.currentLockScope().possibleLock(succ, call.path[:len(call.path)-1], call.isRLock))
 				}
 			}
 		}
@@ -524,9 +520,7 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 	case *ast.Ident:
 		if obj := l.pass.TypesInfo.ObjectOf(expr); obj != nil {
 			if prots, ok := l.protections[obj]; ok {
-				for _, warning := range l.currentLockScope().checkProtections(l.currentBlock(), canonicalPath{obj}, prots, l.currentAccess()) {
-					l.pass.Reportf(expr.Pos(), "%s", warning)
-				}
+				reportAll(l.pass, expr.Pos(), l.currentLockScope().checkProtections(l.currentBlock(), canonicalPath{obj}, prots, l.currentAccess()))
 			}
 		}
 	case *ast.Ellipsis:
@@ -589,9 +583,7 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 			for _, comp := range fieldPath {
 				path = append(path, comp)
 				if prots, ok := l.protections[comp]; ok {
-					for _, warning := range l.currentLockScope().checkProtections(l.currentBlock(), path, prots, l.currentAccess()) {
-						l.pass.Reportf(expr.Pos(), "%s", warning)
-					}
+					reportAll(l.pass, expr.Pos(), l.currentLockScope().checkProtections(l.currentBlock(), path, prots, l.currentAccess()))
 				}
 			}
 		case *types.Func:
@@ -607,9 +599,7 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 			for _, comp := range funcPath {
 				path = append(path, comp)
 				if prots, ok := l.protections[comp]; ok {
-					for _, warning := range l.currentLockScope().checkProtections(l.currentBlock(), path, prots, l.currentAccess()) {
-						l.pass.Reportf(expr.Pos(), "%s", warning)
-					}
+					reportAll(l.pass, expr.Pos(), l.currentLockScope().checkProtections(l.currentBlock(), path, prots, l.currentAccess()))
 				}
 			}
 
@@ -619,9 +609,7 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 				if l.isWithinDeferScope() {
 					scope.applyDeferred(l.currentBlock(), path)
 				} else {
-					for _, warning := range scope.apply(l.currentBlock(), path) {
-						l.pass.Reportf(call.Pos(), "%s", warning)
-					}
+					reportAll(l.pass, call.Pos(), scope.apply(l.currentBlock(), path))
 				}
 			}
 		}

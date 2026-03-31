@@ -1,4 +1,4 @@
-package lockgaurd
+package lockguard
 
 import (
 	"fmt"
@@ -58,7 +58,7 @@ func newLockScope() *lockScope {
 	}
 }
 
-func (s *lockScope) apply(block *cfg.Block, path canonicalPath) []string {
+func (s *lockScope) apply(block *cfg.Block, path canonicalPath) []lockDiagnostic {
 	if !isLockOpPath(path) {
 		return nil
 	}
@@ -77,7 +77,7 @@ func (s *lockScope) apply(block *cfg.Block, path canonicalPath) []string {
 	}
 }
 
-func (s *lockScope) lock(block *cfg.Block, path canonicalPath, isRLock bool) (warnings []string) {
+func (s *lockScope) lock(block *cfg.Block, path canonicalPath, isRLock bool) (warnings []lockDiagnostic) {
 	tree, ok := s.trees[block]
 	if !ok {
 		tree = lockTree{newNode(nil)}
@@ -113,17 +113,17 @@ func (s *lockScope) lock(block *cfg.Block, path canonicalPath, isRLock bool) (wa
 		nd := treePath[i]
 		if !isRLock && (kind == normalLockKind || kind == rwLockKind) {
 			if nd.certainLockCount >= 1 || nd.certainRLockCount >= 1 {
-				warnings = append(warnings, fmt.Sprintf("deadlock: %v - already locked", nd.obj.Name()))
+				warnings = append(warnings, lockDiagnostic{CategoryDeadlock, fmt.Sprintf("acquiring '%v' that is already held [deadlock]", nd.obj.Name())})
 			} else if nd.possibleLockCount >= 1 || nd.possibleRLockCount >= 1 {
-				warnings = append(warnings, fmt.Sprintf("deadlock: %v - possibly already locked", nd.obj.Name()))
+				warnings = append(warnings, lockDiagnostic{CategoryDeadlock, fmt.Sprintf("acquiring '%v' that may be held [deadlock]", nd.obj.Name())})
 			}
 			nd.certainLockCount++
 			nd.possibleLockCount++
 		} else if isRLock && kind == rwLockKind {
 			if nd.certainLockCount >= 1 {
-				warnings = append(warnings, fmt.Sprintf("deadlock: %v - already locked", nd.obj.Name()))
+				warnings = append(warnings, lockDiagnostic{CategoryDeadlock, fmt.Sprintf("acquiring '%v' that is already held [deadlock]", nd.obj.Name())})
 			} else if nd.possibleLockCount >= 1 {
-				warnings = append(warnings, fmt.Sprintf("deadlock: %v - possibly already locked", nd.obj.Name()))
+				warnings = append(warnings, lockDiagnostic{CategoryDeadlock, fmt.Sprintf("acquiring '%v' that may be held [deadlock]", nd.obj.Name())})
 			}
 			nd.certainRLockCount++
 			nd.possibleRLockCount++
@@ -142,7 +142,7 @@ func (s *lockScope) lock(block *cfg.Block, path canonicalPath, isRLock bool) (wa
 	return
 }
 
-func (s *lockScope) possibleLock(block *cfg.Block, path canonicalPath, isRLock bool) (warnings []string) {
+func (s *lockScope) possibleLock(block *cfg.Block, path canonicalPath, isRLock bool) (warnings []lockDiagnostic) {
 	tree, ok := s.trees[block]
 	if !ok {
 		tree = lockTree{newNode(nil)}
@@ -178,16 +178,16 @@ func (s *lockScope) possibleLock(block *cfg.Block, path canonicalPath, isRLock b
 		nd := treePath[i]
 		if !isRLock && (kind == normalLockKind || kind == rwLockKind) {
 			if nd.certainLockCount >= 1 || nd.certainRLockCount >= 1 {
-				warnings = append(warnings, fmt.Sprintf("possible deadlock: %v - already locked", nd.obj.Name()))
+				warnings = append(warnings, lockDiagnostic{CategoryPossibleDeadlock, fmt.Sprintf("acquiring '%v' that is already held [possible deadlock]", nd.obj.Name())})
 			} else if nd.possibleLockCount >= 1 || nd.possibleRLockCount >= 1 {
-				warnings = append(warnings, fmt.Sprintf("possible deadlock: %v - possibly already locked", nd.obj.Name()))
+				warnings = append(warnings, lockDiagnostic{CategoryPossibleDeadlock, fmt.Sprintf("acquiring '%v' that may be held [possible deadlock]", nd.obj.Name())})
 			}
 			nd.possibleLockCount++
 		} else if isRLock && kind == rwLockKind {
 			if nd.certainLockCount >= 1 {
-				warnings = append(warnings, fmt.Sprintf("possible deadlock: %v - already locked", nd.obj.Name()))
+				warnings = append(warnings, lockDiagnostic{CategoryPossibleDeadlock, fmt.Sprintf("acquiring '%v' that is already held [possible deadlock]", nd.obj.Name())})
 			} else if nd.possibleLockCount >= 1 {
-				warnings = append(warnings, fmt.Sprintf("possible deadlock: %v - possibly already locked", nd.obj.Name()))
+				warnings = append(warnings, lockDiagnostic{CategoryPossibleDeadlock, fmt.Sprintf("acquiring '%v' that may be held [possible deadlock]", nd.obj.Name())})
 			}
 			nd.possibleRLockCount++
 		}
@@ -205,7 +205,7 @@ func (s *lockScope) possibleLock(block *cfg.Block, path canonicalPath, isRLock b
 	return
 }
 
-func (s *lockScope) unlock(block *cfg.Block, path canonicalPath, isRLock bool) (warnings []string) {
+func (s *lockScope) unlock(block *cfg.Block, path canonicalPath, isRLock bool) (warnings []lockDiagnostic) {
 	tree, ok := s.trees[block]
 
 	var treePath []*node
@@ -215,9 +215,9 @@ func (s *lockScope) unlock(block *cfg.Block, path canonicalPath, isRLock bool) (
 
 	if len(treePath) == 0 {
 		if isRLock {
-			warnings = append(warnings, fmt.Sprintf("%v - read-unlocking a non-locked lock", path[len(path)-1].Name()))
+			warnings = append(warnings, lockDiagnostic{CategoryInvalidUnlock, fmt.Sprintf("releasing read lock on '%v' that is not held", path[len(path)-1].Name())})
 		} else {
-			warnings = append(warnings, fmt.Sprintf("%v - unlocking a non-locked lock", path[len(path)-1].Name()))
+			warnings = append(warnings, lockDiagnostic{CategoryInvalidUnlock, fmt.Sprintf("releasing '%v' that is not held", path[len(path)-1].Name())})
 		}
 		return
 	}
@@ -251,10 +251,10 @@ func (s *lockScope) unlock(block *cfg.Block, path canonicalPath, isRLock bool) (
 		if !isRLock {
 			if nd.certainLockCount <= 0 {
 				if nd.possibleLockCount > 0 {
-					warnings = append(warnings, fmt.Sprintf("%v - unlocking a possibly non-locked lock", nd.obj.Name()))
+					warnings = append(warnings, lockDiagnostic{CategoryInvalidUnlock, fmt.Sprintf("releasing '%v' that may not be held", nd.obj.Name())})
 					nd.possibleLockCount--
 				} else {
-					warnings = append(warnings, fmt.Sprintf("%v - unlocking a non-locked lock", nd.obj.Name()))
+					warnings = append(warnings, lockDiagnostic{CategoryInvalidUnlock, fmt.Sprintf("releasing '%v' that is not held", nd.obj.Name())})
 				}
 			} else {
 				nd.certainLockCount--
@@ -262,10 +262,10 @@ func (s *lockScope) unlock(block *cfg.Block, path canonicalPath, isRLock bool) (
 			}
 		} else if nd.certainRLockCount <= 0 {
 			if nd.possibleRLockCount > 0 {
-				warnings = append(warnings, fmt.Sprintf("%v - read-unlocking a possibly non-locked lock", nd.obj.Name()))
+				warnings = append(warnings, lockDiagnostic{CategoryInvalidUnlock, fmt.Sprintf("releasing read lock on '%v' that may not be held", nd.obj.Name())})
 				nd.possibleRLockCount--
 			} else {
-				warnings = append(warnings, fmt.Sprintf("%v - read-unlocking a non-locked lock", nd.obj.Name()))
+				warnings = append(warnings, lockDiagnostic{CategoryInvalidUnlock, fmt.Sprintf("releasing read lock on '%v' that is not held", nd.obj.Name())})
 			}
 		} else {
 			nd.certainRLockCount--
@@ -312,14 +312,32 @@ func (s *lockScope) flushDeferred() {
 	s.deferredOps = nil
 }
 
-func (s *lockScope) checkProtections(source *cfg.Block, objectPath canonicalPath, prots []protection, access accessKind) (warnings []string) {
+func (s *lockScope) checkProtections(source *cfg.Block, objectPath canonicalPath, prots []protection, access accessKind) (warnings []lockDiagnostic) {
 	if len(objectPath) == 0 {
 		return nil // Vacuously
 	}
 
+	var verb string
+	if access == writeAccessKind {
+		verb = "writing"
+	} else {
+		verb = "reading"
+	}
+	field := "'" + pathString(objectPath) + "'"
+
+	// lockPaths resolves each protection's lock relative to the object's prefix
+	// and returns the full dot-joined path strings (e.g. "s.mu", "b.GlobalMut").
+	lockPaths := func(ps []protection) []string {
+		names := make([]string, len(ps))
+		for i, p := range ps {
+			names[i] = pathString(copyAppend(objectPath[:len(objectPath)-1], p.lockPath...))
+		}
+		return names
+	}
+
 	tree, ok := s.trees[source]
 	if !ok {
-		return []string{fmt.Sprintf("%s is not held while accessing %s", strings.Join(getLockVariables(prots), ", "), objectPath[len(objectPath)-1].Name())}
+		return []lockDiagnostic{{CategoryMissingLock, fmt.Sprintf("%s %s requires holding %s", verb, field, formatLocks(lockPaths(prots)))}}
 	}
 
 	var missedProts []protection
@@ -337,19 +355,40 @@ func (s *lockScope) checkProtections(source *cfg.Block, objectPath canonicalPath
 	}
 
 	if len(missedProts) > 0 {
-		warnings = append(warnings, fmt.Sprintf("%s is not held while accessing %s", strings.Join(getLockVariables(missedProts), ", "), objectPath[len(objectPath)-1].Name()))
+		warnings = append(warnings, lockDiagnostic{CategoryMissingLock, fmt.Sprintf("%s %s requires holding %s", verb, field, formatLocks(lockPaths(missedProts)))})
 	}
 	if len(possiblyMissedProts) > 0 {
-		warnings = append(warnings, fmt.Sprintf("%s is possibly not held while accessing %s", strings.Join(getLockVariables(possiblyMissedProts), ", "), objectPath[len(objectPath)-1].Name()))
+		warnings = append(warnings, lockDiagnostic{CategoryPossiblyMissingLock, fmt.Sprintf("%s %s requires holding %s (not held on all paths)", verb, field, formatLocks(lockPaths(possiblyMissedProts)))})
 	}
 	return
 }
 
-func getLockVariables(prots []protection) (vars []string) {
-	for _, prot := range prots {
-		vars = append(vars, prot.lockObj().Name())
+// pathString returns the dot-joined names of every object in a canonical path,
+// e.g. [s, i] -> "s.i", [globalVar] -> "globalVar".
+func pathString(path canonicalPath) string {
+	parts := make([]string, len(path))
+	for i, obj := range path {
+		parts[i] = obj.Name()
 	}
-	return
+	return strings.Join(parts, ".")
+}
+
+// formatLocks joins quoted lock names, e.g. "'mu'" or "'mu1' and 'mu2'" or "'mu1', 'mu2' and 'mu3'".
+func formatLocks(names []string) string {
+	quoted := make([]string, len(names))
+	for i, name := range names {
+		quoted[i] = "'" + name + "'"
+	}
+	switch len(quoted) {
+	case 0:
+		return ""
+	case 1:
+		return quoted[0]
+	case 2:
+		return quoted[0] + " and " + quoted[1]
+	default:
+		return strings.Join(quoted[:len(quoted)-1], ", ") + " and " + quoted[len(quoted)-1]
+	}
 }
 
 func isLockOpPath(path canonicalPath) bool {

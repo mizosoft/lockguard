@@ -1,4 +1,4 @@
-package lockgaurd
+package lockguard
 
 import (
 	"fmt"
@@ -178,7 +178,7 @@ func (f *protectionsFinder) findStructProtections(typ *ast.StructType, spec *ast
 
 				prot, err := f.findProtection(loc, directive, value)
 				if err != nil {
-					f.pass.Reportf(field.Tag.ValuePos, "%v", err)
+					f.pass.Report(analysis.Diagnostic{Pos: field.Tag.ValuePos, Category: string(CategoryInvalidAnnotation), Message: err.Error()})
 				} else {
 					prots = append(prots, prot)
 				}
@@ -260,7 +260,7 @@ func (f *protectionsFinder) findFuncProtections(funcType *ast.FuncDecl, file *as
 
 			prot, err := f.findProtection(loc, directive, value)
 			if err != nil {
-				f.pass.Reportf(comment.Pos(), "%v", err)
+				f.pass.Report(analysis.Diagnostic{Pos: comment.Pos(), Category: string(CategoryInvalidAnnotation), Message: err.Error()})
 				continue
 			}
 			prot.withReceiver = withReceiver
@@ -296,7 +296,7 @@ func (f *protectionsFinder) findVarDeclProtections(decl *ast.GenDecl, file *ast.
 		for _, comment := range decl.Doc.List {
 			if directive, value, ok := parseCommentDirective(comment.Text); ok {
 				if prot, err := f.findProtection(loc, directive, value); err != nil {
-					f.pass.Reportf(comment.Pos(), "%v", err)
+					f.pass.Report(analysis.Diagnostic{Pos: comment.Pos(), Category: string(CategoryInvalidAnnotation), Message: err.Error()})
 				} else {
 					declProts = append(declProts, prot)
 				}
@@ -312,7 +312,7 @@ func (f *protectionsFinder) findVarDeclProtections(decl *ast.GenDecl, file *ast.
 				if directive, value, ok := parseCommentDirective(comment.Text); ok {
 					prot, err := f.findProtection(loc, directive, value)
 					if err != nil {
-						f.pass.Reportf(comment.Pos(), "%v", err)
+						f.pass.Report(analysis.Diagnostic{Pos: comment.Pos(), Category: string(CategoryInvalidAnnotation), Message: err.Error()})
 					} else {
 						specProts = append(specProts, prot)
 					}
