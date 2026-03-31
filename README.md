@@ -61,9 +61,14 @@ type WithMethod struct {
 Use a doc comment directive to declare that a function requires a lock to be held by the caller:
 
 ```go
+type Server struct {
+  mu sync.Mutex
+  data int `protected_by:"mu"`
+}
+
 //lockguard:protected_by s.mu
 func (s *Server) handleRequest() {
-    // mu is assumed held here; accessing s.data is allowed.
+    // mu is assumed to be held here; accessing s.data is allowed.
     s.data++
 }
 ```
