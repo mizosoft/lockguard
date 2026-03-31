@@ -323,14 +323,14 @@ func (s *lockScope) checkProtections(source *cfg.Block, objectPath canonicalPath
 	} else {
 		verb = "reading"
 	}
-	field := "'" + pathString(objectPath) + "'"
+	field := "'" + objectPath.String() + "'"
 
 	// lockPaths resolves each protection's lock relative to the object's prefix
 	// and returns the full dot-joined path strings (e.g. "s.mu", "b.GlobalMut").
 	lockPaths := func(ps []protection) []string {
 		names := make([]string, len(ps))
 		for i, p := range ps {
-			names[i] = pathString(copyAppend(objectPath[:len(objectPath)-1], p.lockPath...))
+			names[i] = canonicalPath(copyAppend(objectPath[:len(objectPath)-1], p.lockPath...)).String()
 		}
 		return names
 	}
@@ -361,16 +361,6 @@ func (s *lockScope) checkProtections(source *cfg.Block, objectPath canonicalPath
 		warnings = append(warnings, lockDiagnostic{CategoryPossiblyMissingLock, fmt.Sprintf("%s %s requires holding %s (not held on all paths)", verb, field, formatLocks(lockPaths(possiblyMissedProts)))})
 	}
 	return
-}
-
-// pathString returns the dot-joined names of every object in a canonical path,
-// e.g. [s, i] -> "s.i", [globalVar] -> "globalVar".
-func pathString(path canonicalPath) string {
-	parts := make([]string, len(path))
-	for i, obj := range path {
-		parts[i] = obj.Name()
-	}
-	return strings.Join(parts, ".")
 }
 
 // formatLocks joins quoted lock names, e.g. "'mu'" or "'mu1' and 'mu2'" or "'mu1', 'mu2' and 'mu3'".

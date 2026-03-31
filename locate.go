@@ -5,20 +5,18 @@ import (
 	"go/token"
 	"go/types"
 	"slices"
+	"strings"
 )
 
 // The full path to follow from some type context to locate an object (a field or a method).
 type canonicalPath []types.Object
 
 func (c canonicalPath) String() string {
-	str := ""
-	for _, obj := range c {
-		if len(str) > 0 {
-			str += "."
-		}
-		str += "(" + obj.String() + ")"
+	parts := make([]string, len(c))
+	for i, obj := range c {
+		parts[i] = obj.Name()
 	}
-	return str
+	return strings.Join(parts, ".")
 }
 
 type locator func(name *ast.Ident) canonicalPath
