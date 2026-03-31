@@ -56,6 +56,30 @@ type WithMethod struct {
 }
 ```
 
+Lockguard is smart with embedded fields.
+
+```go
+type WithLockEmbedded struct {
+  sync.Mutex
+  x int `protected_by:"sync.Mutex"` // Name embedded field.
+}
+
+type Outer struct {
+  embeddedLock WithLockEmbedded
+  x int `protected_by:"embeddedLock"` // Name embedded field.
+}
+
+func f() {
+  var o Outer
+  
+  o.embeddedLock.Lock()
+  defer o.embeddedLock.Lock()
+  
+  o.x++
+  o.embeddedLock.x++ // This also works, as Lockguard knows locking o.embeddedLock automatically locks o.embeddedLock.(sync.Mutex).
+}
+```
+
 ### Functions and methods
 
 Use a doc comment directive to declare that a function requires a lock to be held by the caller:
@@ -160,6 +184,15 @@ expression doesn't locate a lock field mu
 ```
 
 A struct tag or `//lockguard:` comment directive could not be parsed or resolved to a known lock object.
+
+### Lock leak
+
+```
+'s.mu' held at function exit (possible lock leak)
+read lock on 's.mu' held at function exit (possible lock leak)
+```
+
+A lock is still definitively held when the function returns, meaning it was acquired but never released. This is typically a missing `Unlock` / `RUnlock` call, or a missing `defer` for an early-return path.
 
 ## TryLock support
 
