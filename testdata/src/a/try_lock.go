@@ -151,8 +151,8 @@ func earlyReturnGuard() {
 	if !s.mut.TryLock() {
 		return
 	}
-	s.i++          // want `writing 's\.i' requires holding 's\.mut'`
-	s.mut.Unlock() // want `releasing 'mut' that is not held`
+	s.i++
+	s.mut.Unlock()
 }
 
 // Same pattern but with deferred unlock.
@@ -162,7 +162,7 @@ func earlyReturnGuardDeferred() {
 		return
 	}
 	defer s.mut.Unlock()
-	s.i++ // want `writing 's\.i' requires holding 's\.mut'`
+	s.i++
 }
 
 // The non-negated form: the else branch is the success path.
@@ -175,13 +175,13 @@ func earlyReturnGuardTwoLocks() {
 		return
 	}
 	if !t.mu2.TryLock() {
-		t.mu1.Unlock() // want `releasing 'mu1' that is not held`
+		t.mu1.Unlock() // OK
 		return
 	}
-	t.a++          // want `writing 't\.a' requires holding 't\.mu1'`
-	t.b++          // want `writing 't\.b' requires holding 't\.mu2'`
-	t.mu1.Unlock() // want `releasing 'mu1' that is not held`
-	t.mu2.Unlock() // want `releasing 'mu2' that is not held`
+	t.a++          // OK
+	t.b++          // OK
+	t.mu1.Unlock() // OK
+	t.mu2.Unlock() // OK
 }
 
 // TryLocking a lock that is already held is a deadlock.

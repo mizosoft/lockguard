@@ -267,6 +267,14 @@ func (l *lockAnalyzer) analyzeCfg(block *ast.BlockStmt, entry *cfg.Block) {
 			switch succ.Kind {
 			case cfg.KindIfThen:
 				calls = l.evaluateTryLock(branchCond, true)
+			case cfg.KindIfDone:
+				// When there is no else clause, KindIfDone is a direct successor of the
+				// condition block and represents the "false" (not-taken) branch. This
+				// handles the early-return TryLock guard pattern:
+				//  if !mu.TryLock() {
+				//    return
+				//  } here TryLock succeeded — lock is held
+				calls = l.evaluateTryLock(branchCond, false)
 			case cfg.KindIfElse:
 				calls = l.evaluateTryLock(branchCond, false)
 			default:
