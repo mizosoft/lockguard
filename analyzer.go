@@ -162,9 +162,12 @@ func (l *lockAnalyzer) analyzeDecl(decl ast.Decl) {
 		if decl.Body == nil {
 			return // External/declared-only function; no body to analyze.
 		}
+
 		l.enterLockScope()
-		l.analyzeCfg(decl.Body, nil)
+		exitBlocks := l.analyzeCfg(decl.Body, nil)
+		leakDiags := l.currentLockScope().close(exitBlocks)
 		l.exitLockScope()
+		reportAll(l.pass, decl.Body.Rbrace, leakDiags)
 	case *ast.GenDecl:
 		if decl.Tok == token.VAR {
 			for _, spec := range decl.Specs {
@@ -186,7 +189,7 @@ func toposort(block *cfg.Block, order []*cfg.Block, used map[int32]bool) []*cfg.
 	return append(order, block)
 }
 
-func (l *lockAnalyzer) analyzeCfg(block *ast.BlockStmt, entry *cfg.Block) {
+func (l *lockAnalyzer) analyzeCfg(block *ast.BlockStmt, entry *cfg.Block) (exitBlocks []*cfg.Block) {
 	g := cfg.New(block, func(expr *ast.CallExpr) bool {
 		return true
 	})
@@ -211,7 +214,7 @@ func (l *lockAnalyzer) analyzeCfg(block *ast.BlockStmt, entry *cfg.Block) {
 				}
 
 				l.currentLockScope().apply(g.Blocks[0], copyAppend(lockPath, locateFromObjByName(prot.lockObj(), lockFunc)...))
-				l.currentLockScope().applyDeferred(g.Blocks[0], copyAppend(lockPath, locateFromObjByName(prot.lockObj(), unlockFunc)...))
+				l.currentLockScope().applyDeferred(copyAppend(lockPath, locateFromObjByName(prot.lockObj(), unlockFunc)...))
 			}
 		}
 	}
@@ -230,6 +233,17 @@ func (l *lockAnalyzer) analyzeCfg(block *ast.BlockStmt, entry *cfg.Block) {
 		}
 	}
 	slices.Reverse(order)
+
+	// Register sink blocks (no successors) as function exit points for leak detection.
+	// Only register for top-level function CFGs (entry == nil) to avoid false positives
+	// from inner block statements.
+	if entry == nil && len(l.lockScopes) > 0 {
+		for _, b := range order {
+			if len(b.Succs) == 0 {
+				exitBlocks = append(exitBlocks, b)
+			}
+		}
+	}
 
 	for _, b := range order {
 		l.enterBlock(b)
@@ -293,6 +307,7 @@ func (l *lockAnalyzer) analyzeCfg(block *ast.BlockStmt, entry *cfg.Block) {
 			}
 		}
 	}
+	return
 }
 
 func (l *lockAnalyzer) evaluateTryLock(expr ast.Expr, evalTarget bool) []tryLockCall {
@@ -549,14 +564,17 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 			l.enterLockScope()
 		}
 
+		var exitBlocks []*cfg.Block
 		if retainLockScope {
 			l.analyzeCfg(expr.Body, l.currentBlock()) // Follow up with current flow.
 		} else {
-			l.analyzeCfg(expr.Body, nil)
+			exitBlocks = l.analyzeCfg(expr.Body, nil)
 		}
 
 		if !retainLockScope {
+			diagLeaks := l.currentLockScope().close(exitBlocks)
 			l.exitLockScope()
+			reportAll(l.pass, expr.Body.Rbrace, diagLeaks)
 		}
 	case *ast.CompositeLit:
 		for _, el := range expr.Elts {
@@ -615,7 +633,7 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 			if call, isCall := ancestorAs[*ast.CallExpr](l, 1); isCall && isLockOpPath(path) {
 				scope := l.currentLockScope()
 				if l.isWithinDeferScope() {
-					scope.applyDeferred(l.currentBlock(), path)
+					scope.applyDeferred(path)
 				} else {
 					reportAll(l.pass, call.Pos(), scope.apply(l.currentBlock(), path))
 				}

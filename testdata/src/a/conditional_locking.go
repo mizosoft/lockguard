@@ -33,7 +33,7 @@ func (c *conditionalLock) lockInIfNoUnlock(cond bool) {
 	}
 	// After if: lock is POSSIBLY held (some paths hold it)
 	c.data++ // want `writing 'c\.data' requires holding 'c\.mu' \(not held on all paths\)`
-}
+} // want `'c\.mu' possibly held at function exit \(possible lock leak\)`
 
 func (c *conditionalLock) lockBeforeIf(cond bool) {
 	c.mu.Lock()
@@ -68,7 +68,7 @@ func (c *conditionalLock) lockInOneBranch(cond bool) {
 	}
 	// After if-else: lock is POSSIBLY held
 	c.data++ // want `writing 'c\.data' requires holding 'c\.mu' \(not held on all paths\)`
-}
+} // want `'c\.mu' possibly held at function exit \(possible lock leak\)`
 
 func (c *conditionalLock) lockInElseOnly(cond bool) {
 	if cond {
@@ -78,7 +78,7 @@ func (c *conditionalLock) lockInElseOnly(cond bool) {
 	}
 	// After if-else: lock is POSSIBLY held
 	c.data++ // want `writing 'c\.data' requires holding 'c\.mu' \(not held on all paths\)`
-}
+} // want `'c\.mu' possibly held at function exit \(possible lock leak\)`
 
 func (c *conditionalLock) unlockInOneBranch(cond bool) {
 	c.mu.Lock()
@@ -89,7 +89,7 @@ func (c *conditionalLock) unlockInOneBranch(cond bool) {
 	}
 	// After if: lock is POSSIBLY held
 	c.data++ // want `writing 'c\.data' requires holding 'c\.mu' \(not held on all paths\)`
-}
+} // want `'c\.mu' possibly held at function exit \(possible lock leak\)`
 
 // ============================================================================
 // If-else-if chains
@@ -105,7 +105,7 @@ func (c *conditionalLock) lockInSomeElseIf(a, b, cond bool) {
 	}
 	// Lock is POSSIBLY held (some but not all paths)
 	c.data++ // want `writing 'c\.data' requires holding 'c\.mu' \(not held on all paths\)`
-}
+} // want `'c\.mu' possibly held at function exit \(possible lock leak\)`
 
 func (c *conditionalLock) lockInAllElseIfPaths(a, b bool) {
 	if a {
@@ -192,7 +192,7 @@ func (c *conditionalLock) lockInOneCaseNoUnlock(v int) {
 	}
 	// Lock is POSSIBLY held
 	c.data++ // want `writing 'c\.data' requires holding 'c\.mu' \(not held on all paths\)`
-}
+} // want `'c\.mu' possibly held at function exit \(possible lock leak\)`
 
 func (c *conditionalLock) lockInAllCases(v int) {
 	switch v {
@@ -296,7 +296,7 @@ func (t *twoLocks) conditionalTwoLocks(cond1, cond2 bool) {
 	if cond2 {
 		t.mu2.Unlock() // want `releasing 'mu2' that may not be held`
 	}
-}
+} // want `'t\.mu1' possibly held at function exit \(possible lock leak\)` `'t\.mu2' possibly held at function exit \(possible lock leak\)`
 
 // ============================================================================
 // Early returns with conditional locks
@@ -376,7 +376,7 @@ func (c *conditionalLock) complexFlow(a, b, cond bool) {
 
 	// Lock is POSSIBLY held (some paths acquire it)
 	c.data++ // want `writing 'c\.data' requires holding 'c\.mu' \(not held on all paths\)`
-}
+} // want `'c\.mu' possibly held at function exit \(possible lock leak\)`
 
 func (c *conditionalLock) switchInIf(v int, cond bool) {
 	if cond {
@@ -412,7 +412,7 @@ func (c *conditionalLock) loopWithConditionalBreak(cond bool) {
 	}
 	// Lock is POSSIBLY held (released if break was taken)
 	c.data++ // want `writing 'c\.data' requires holding 'c\.mu' \(not held on all paths\)`
-}
+} // want `'c\.mu' possibly held at function exit \(possible lock leak\)`
 
 func (c *conditionalLock) loopWithConditionalContinue(cond bool) {
 	for i := 0; i < 10; i++ {
@@ -486,4 +486,4 @@ func (c *conditionalLock) flagPattern(cond bool) {
 	if locked {
 		c.mu.Unlock() // want `releasing 'mu' that may not be held`
 	}
-}
+} // want `'c\.mu' possibly held at function exit \(possible lock leak\)`

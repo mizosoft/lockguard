@@ -48,8 +48,8 @@ type deferredOp struct {
 }
 
 type lockScope struct {
-	trees       map[*cfg.Block]lockTree // Map's from CFG block IDs to the corresponding lockTree identifying lock states.
-	deferredOps []deferredOp
+	trees           map[*cfg.Block]lockTree // Map's from CFG block IDs to the corresponding lockTree identifying lock states.
+	deferredApplies []canonicalPath
 }
 
 func newLockScope() *lockScope {
@@ -77,7 +77,7 @@ func (s *lockScope) apply(block *cfg.Block, path canonicalPath) []lockDiagnostic
 	}
 }
 
-func (s *lockScope) lock(block *cfg.Block, path canonicalPath, isRLock bool) (warnings []lockDiagnostic) {
+func (s *lockScope) lock(block *cfg.Block, path canonicalPath, isRLock bool) (diags []lockDiagnostic) {
 	tree, ok := s.trees[block]
 	if !ok {
 		tree = lockTree{newNode(nil)}
@@ -113,17 +113,17 @@ func (s *lockScope) lock(block *cfg.Block, path canonicalPath, isRLock bool) (wa
 		nd := treePath[i]
 		if !isRLock && (kind == normalLockKind || kind == rwLockKind) {
 			if nd.certainLockCount >= 1 || nd.certainRLockCount >= 1 {
-				warnings = append(warnings, lockDiagnostic{CategoryDeadlock, fmt.Sprintf("acquiring '%v' that is already held [deadlock]", nd.obj.Name())})
+				diags = append(diags, lockDiagnostic{CategoryDeadlock, fmt.Sprintf("acquiring '%v' that is already held [deadlock]", nd.obj.Name())})
 			} else if nd.possibleLockCount >= 1 || nd.possibleRLockCount >= 1 {
-				warnings = append(warnings, lockDiagnostic{CategoryDeadlock, fmt.Sprintf("acquiring '%v' that may be held [deadlock]", nd.obj.Name())})
+				diags = append(diags, lockDiagnostic{CategoryDeadlock, fmt.Sprintf("acquiring '%v' that may be held [deadlock]", nd.obj.Name())})
 			}
 			nd.certainLockCount++
 			nd.possibleLockCount++
 		} else if isRLock && kind == rwLockKind {
 			if nd.certainLockCount >= 1 {
-				warnings = append(warnings, lockDiagnostic{CategoryDeadlock, fmt.Sprintf("acquiring '%v' that is already held [deadlock]", nd.obj.Name())})
+				diags = append(diags, lockDiagnostic{CategoryDeadlock, fmt.Sprintf("acquiring '%v' that is already held [deadlock]", nd.obj.Name())})
 			} else if nd.possibleLockCount >= 1 {
-				warnings = append(warnings, lockDiagnostic{CategoryDeadlock, fmt.Sprintf("acquiring '%v' that may be held [deadlock]", nd.obj.Name())})
+				diags = append(diags, lockDiagnostic{CategoryDeadlock, fmt.Sprintf("acquiring '%v' that may be held [deadlock]", nd.obj.Name())})
 			}
 			nd.certainRLockCount++
 			nd.possibleRLockCount++
@@ -142,7 +142,7 @@ func (s *lockScope) lock(block *cfg.Block, path canonicalPath, isRLock bool) (wa
 	return
 }
 
-func (s *lockScope) possibleLock(block *cfg.Block, path canonicalPath, isRLock bool) (warnings []lockDiagnostic) {
+func (s *lockScope) possibleLock(block *cfg.Block, path canonicalPath, isRLock bool) (diags []lockDiagnostic) {
 	tree, ok := s.trees[block]
 	if !ok {
 		tree = lockTree{newNode(nil)}
@@ -178,16 +178,16 @@ func (s *lockScope) possibleLock(block *cfg.Block, path canonicalPath, isRLock b
 		nd := treePath[i]
 		if !isRLock && (kind == normalLockKind || kind == rwLockKind) {
 			if nd.certainLockCount >= 1 || nd.certainRLockCount >= 1 {
-				warnings = append(warnings, lockDiagnostic{CategoryPossibleDeadlock, fmt.Sprintf("acquiring '%v' that is already held [possible deadlock]", nd.obj.Name())})
+				diags = append(diags, lockDiagnostic{CategoryPossibleDeadlock, fmt.Sprintf("acquiring '%v' that is already held [possible deadlock]", nd.obj.Name())})
 			} else if nd.possibleLockCount >= 1 || nd.possibleRLockCount >= 1 {
-				warnings = append(warnings, lockDiagnostic{CategoryPossibleDeadlock, fmt.Sprintf("acquiring '%v' that may be held [possible deadlock]", nd.obj.Name())})
+				diags = append(diags, lockDiagnostic{CategoryPossibleDeadlock, fmt.Sprintf("acquiring '%v' that may be held [possible deadlock]", nd.obj.Name())})
 			}
 			nd.possibleLockCount++
 		} else if isRLock && kind == rwLockKind {
 			if nd.certainLockCount >= 1 {
-				warnings = append(warnings, lockDiagnostic{CategoryPossibleDeadlock, fmt.Sprintf("acquiring '%v' that is already held [possible deadlock]", nd.obj.Name())})
+				diags = append(diags, lockDiagnostic{CategoryPossibleDeadlock, fmt.Sprintf("acquiring '%v' that is already held [possible deadlock]", nd.obj.Name())})
 			} else if nd.possibleLockCount >= 1 {
-				warnings = append(warnings, lockDiagnostic{CategoryPossibleDeadlock, fmt.Sprintf("acquiring '%v' that may be held [possible deadlock]", nd.obj.Name())})
+				diags = append(diags, lockDiagnostic{CategoryPossibleDeadlock, fmt.Sprintf("acquiring '%v' that may be held [possible deadlock]", nd.obj.Name())})
 			}
 			nd.possibleRLockCount++
 		}
@@ -205,7 +205,7 @@ func (s *lockScope) possibleLock(block *cfg.Block, path canonicalPath, isRLock b
 	return
 }
 
-func (s *lockScope) unlock(block *cfg.Block, path canonicalPath, isRLock bool) (warnings []lockDiagnostic) {
+func (s *lockScope) unlock(block *cfg.Block, path canonicalPath, isRLock bool) (diags []lockDiagnostic) {
 	tree, ok := s.trees[block]
 
 	var treePath []*node
@@ -215,9 +215,9 @@ func (s *lockScope) unlock(block *cfg.Block, path canonicalPath, isRLock bool) (
 
 	if len(treePath) == 0 {
 		if isRLock {
-			warnings = append(warnings, lockDiagnostic{CategoryInvalidUnlock, fmt.Sprintf("releasing read lock on '%v' that is not held", path[len(path)-1].Name())})
+			diags = append(diags, lockDiagnostic{CategoryInvalidUnlock, fmt.Sprintf("releasing read lock on '%v' that is not held", path[len(path)-1].Name())})
 		} else {
-			warnings = append(warnings, lockDiagnostic{CategoryInvalidUnlock, fmt.Sprintf("releasing '%v' that is not held", path[len(path)-1].Name())})
+			diags = append(diags, lockDiagnostic{CategoryInvalidUnlock, fmt.Sprintf("releasing '%v' that is not held", path[len(path)-1].Name())})
 		}
 		return
 	}
@@ -251,10 +251,10 @@ func (s *lockScope) unlock(block *cfg.Block, path canonicalPath, isRLock bool) (
 		if !isRLock {
 			if nd.certainLockCount <= 0 {
 				if nd.possibleLockCount > 0 {
-					warnings = append(warnings, lockDiagnostic{CategoryInvalidUnlock, fmt.Sprintf("releasing '%v' that may not be held", nd.obj.Name())})
+					diags = append(diags, lockDiagnostic{CategoryInvalidUnlock, fmt.Sprintf("releasing '%v' that may not be held", nd.obj.Name())})
 					nd.possibleLockCount--
 				} else {
-					warnings = append(warnings, lockDiagnostic{CategoryInvalidUnlock, fmt.Sprintf("releasing '%v' that is not held", nd.obj.Name())})
+					diags = append(diags, lockDiagnostic{CategoryInvalidUnlock, fmt.Sprintf("releasing '%v' that is not held", nd.obj.Name())})
 				}
 			} else {
 				nd.certainLockCount--
@@ -262,10 +262,10 @@ func (s *lockScope) unlock(block *cfg.Block, path canonicalPath, isRLock bool) (
 			}
 		} else if nd.certainRLockCount <= 0 {
 			if nd.possibleRLockCount > 0 {
-				warnings = append(warnings, lockDiagnostic{CategoryInvalidUnlock, fmt.Sprintf("releasing read lock on '%v' that may not be held", nd.obj.Name())})
+				diags = append(diags, lockDiagnostic{CategoryInvalidUnlock, fmt.Sprintf("releasing read lock on '%v' that may not be held", nd.obj.Name())})
 				nd.possibleRLockCount--
 			} else {
-				warnings = append(warnings, lockDiagnostic{CategoryInvalidUnlock, fmt.Sprintf("releasing read lock on '%v' that is not held", nd.obj.Name())})
+				diags = append(diags, lockDiagnostic{CategoryInvalidUnlock, fmt.Sprintf("releasing read lock on '%v' that is not held", nd.obj.Name())})
 			}
 		} else {
 			nd.certainRLockCount--
@@ -298,21 +298,71 @@ func (s *lockScope) merge(src *cfg.Block, dst *cfg.Block) {
 	}
 }
 
-func (s *lockScope) applyDeferred(entry *cfg.Block, path canonicalPath) {
+// Applies a lock/unlock operation in a deferred manner,
+func (s *lockScope) applyDeferred(path canonicalPath) {
 	if !isLockOpPath(path) {
 		return
 	}
-	s.deferredOps = append(s.deferredOps, deferredOp{entry, path})
+	s.deferredApplies = append(s.deferredApplies, path)
 }
 
-func (s *lockScope) flushDeferred() {
-	for _, entry := range s.deferredOps {
-		s.apply(entry.block, entry.path)
+// Closes this scope by applying deferred operations & detecting lock leaks from given exit scpoes.
+func (s *lockScope) close(exitBlocks []*cfg.Block) (diag []lockDiagnostic) {
+	for _, block := range exitBlocks {
+		for _, entry := range s.deferredApplies {
+			s.apply(block, entry)
+		}
 	}
-	s.deferredOps = nil
+	s.deferredApplies = nil
+
+	// Report any locks still held at each exit point.
+	// Each exit block that holds a lock emits its own diagnostic, so callers
+	// can see exactly how many distinct exit paths leave the lock unreleased.
+	var diags []lockDiagnostic
+	for _, exitBlock := range exitBlocks {
+		tree, ok := s.trees[exitBlock]
+		if !ok || tree.root == nil {
+			continue
+		}
+		diags = append(diags, collectHeldLocks(tree.root, nil)...)
+	}
+	return diags
 }
 
-func (s *lockScope) checkProtections(source *cfg.Block, objectPath canonicalPath, prots []protection, access accessKind) (warnings []lockDiagnostic) {
+func collectHeldLocks(root *node, path canonicalPath) []lockDiagnostic {
+	var diags []lockDiagnostic
+	if root.obj != nil {
+		path = append(path, root.obj)
+		if lockKindOfObject(root.obj) != noneLockKind && root.certainLockCount+root.certainRLockCount+root.possibleLockCount+root.possibleRLockCount > 0 {
+			name := path.String()
+			if root.certainLockCount > 0 || root.possibleLockCount > 0 {
+				var msg string
+				if root.certainLockCount > 0 {
+					msg = fmt.Sprintf("'%s' held at function exit (lock leak)", name)
+				} else {
+					msg = fmt.Sprintf("'%s' possibly held at function exit (possible lock leak)", name)
+				}
+				diags = append(diags, lockDiagnostic{CategoryLockedAtExit, msg})
+			}
+			if root.certainRLockCount > 0 || root.possibleRLockCount > 0 {
+				var msg string
+				if root.certainRLockCount > 0 {
+					msg = fmt.Sprintf("read lock on '%s' held at function exit (lock leak)", name)
+				} else {
+					msg = fmt.Sprintf("read lock on '%s' possibly held at function exit (possible lock leak)", name)
+				}
+				diags = append(diags, lockDiagnostic{CategoryLockedAtExit, msg})
+			}
+		}
+	}
+
+	for _, child := range root.children {
+		diags = append(diags, collectHeldLocks(child, path)...)
+	}
+	return diags
+}
+
+func (s *lockScope) checkProtections(source *cfg.Block, objectPath canonicalPath, prots []protection, access accessKind) (diags []lockDiagnostic) {
 	if len(objectPath) == 0 {
 		return nil // Vacuously
 	}
@@ -355,10 +405,10 @@ func (s *lockScope) checkProtections(source *cfg.Block, objectPath canonicalPath
 	}
 
 	if len(missedProts) > 0 {
-		warnings = append(warnings, lockDiagnostic{CategoryMissingLock, fmt.Sprintf("%s %s requires holding %s", verb, field, formatLocks(lockPaths(missedProts)))})
+		diags = append(diags, lockDiagnostic{CategoryMissingLock, fmt.Sprintf("%s %s requires holding %s", verb, field, formatLocks(lockPaths(missedProts)))})
 	}
 	if len(possiblyMissedProts) > 0 {
-		warnings = append(warnings, lockDiagnostic{CategoryPossiblyMissingLock, fmt.Sprintf("%s %s requires holding %s (not held on all paths)", verb, field, formatLocks(lockPaths(possiblyMissedProts)))})
+		diags = append(diags, lockDiagnostic{CategoryPossiblyMissingLock, fmt.Sprintf("%s %s requires holding %s (not held on all paths)", verb, field, formatLocks(lockPaths(possiblyMissedProts)))})
 	}
 	return
 }

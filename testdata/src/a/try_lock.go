@@ -57,7 +57,7 @@ func tryLockNoElseNoUnlock() {
 		s.i++
 	}
 	s.i++ // want `writing 's\.i' requires holding 's\.mut' \(not held on all paths\)`
-}
+} // want `'s\.mut' possibly held at function exit \(possible lock leak\)`
 
 // ============================================================================
 // Negated TryLock
@@ -121,7 +121,7 @@ func tryLockAnd() {
 		t.a++ // want `writing 't\.a' requires holding 't\.mu1' \(not held on all paths\)`
 		t.b++ // want `writing 't\.b' requires holding 't\.mu2' \(not held on all paths\)`
 	}
-}
+} // want `'t\.mu1' possibly held at function exit \(possible lock leak\)` `'t\.mu2' possibly held at function exit \(possible lock leak\)`
 
 // With ||, it is unknown which lock succeeded in the true branch, so both are
 // only possibly held. In the false branch, neither was acquired.
@@ -134,7 +134,7 @@ func tryLockOr() {
 		t.a++ // want `writing 't\.a' requires holding 't\.mu1'`
 		t.b++ // want `writing 't\.b' requires holding 't\.mu2'`
 	}
-}
+} // want `'t\.mu1' possibly held at function exit \(possible lock leak\)` `'t\.mu2' possibly held at function exit \(possible lock leak\)`
 
 // ============================================================================
 // Deadlock detection

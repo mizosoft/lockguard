@@ -25,9 +25,10 @@ func (c *controlFlow) lockInBranch(cond bool) {
 	}
 	c.x++ // want `writing 'c\.x' requires holding 'c\.mu' \(not held on all paths\)`
 	if cond {
+		// Currently lockguard can't know what cond implies from above.
 		c.mu.Unlock() // want `releasing 'mu' that may not be held`
 	}
-}
+} // want `'c\.mu' possibly held at function exit \(possible lock leak\)`
 
 func (c *controlFlow) lockBeforeBranch(cond bool) {
 	c.mu.Lock()

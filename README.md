@@ -52,6 +52,7 @@ func (l *Locker) Lock() *sync.Mutex {
 }
 
 type WithMethod struct {
+  locker Locker
   data int `protected_by:"locker.Lock()"`  // Lock through a method.
 }
 ```
@@ -188,11 +189,18 @@ A struct tag or `//lockguard:` comment directive could not be parsed or resolved
 ### Lock leak
 
 ```
-'s.mu' held at function exit (possible lock leak)
-read lock on 's.mu' held at function exit (possible lock leak)
+'s.mu' held at function exit (lock leak)
+read lock on 's.mu' held at function exit (lock leak)
 ```
 
 A lock is still definitively held when the function returns, meaning it was acquired but never released. This is typically a missing `Unlock` / `RUnlock` call, or a missing `defer` for an early-return path.
+
+```
+'s.mu' possibly held at function exit (possible lock leak)
+read lock on 's.mu' possibly held at function exit (possible lock leak)
+```
+
+A lock is possibly held at function exit — it was acquired on some paths but not released on all of them. This commonly occurs when a lock is acquired inside a branch (`if`, `switch`, `TryLock`) and not unconditionally released before the function returns.
 
 ## TryLock support
 

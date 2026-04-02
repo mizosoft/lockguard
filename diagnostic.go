@@ -38,6 +38,10 @@ const (
 	// a struct tag or a //lockguard: comment directive — cannot be parsed or
 	// resolved to a known lock object.
 	CategoryInvalidAnnotation Category = "invalid-annotation"
+
+	// CategoryLockedAtExit is emitted when a lock is still held when a
+	// function returns, meaning it was acquired but never released (lock leak).
+	CategoryLockedAtExit Category = "lock-leak"
 )
 
 // lockDiagnostic pairs a Category with a human-readable message. Functions in
