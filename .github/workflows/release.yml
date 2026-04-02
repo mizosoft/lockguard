@@ -1,0 +1,33 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Build binaries
+        run: |
+          for os in linux darwin windows; do
+            for arch in amd64 arm64; do
+              ext=""
+              [ "$os" = "windows" ] && ext=".exe"
+              GOOS=$os GOARCH=$arch go build -o dist/lockguard-${os}-${arch}${ext} ./cmd/lockguard
+            done
+          done
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
