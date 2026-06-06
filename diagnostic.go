@@ -1,10 +1,6 @@
 package lockguard
 
-import (
-	"go/token"
-
-	"golang.org/x/tools/go/analysis"
-)
+import "go/token"
 
 // Category classifies a Lockguard diagnostic. Drivers and linting tools can
 // use it to filter or suppress specific classes of finding independently of
@@ -26,13 +22,16 @@ const (
 	// definitely held, which would block forever on a non-reentrant mutex.
 	CategoryDeadlock Category = "deadlock"
 
-	// CategoryPossibleDeadlock is emitted when a lock is acquired (via
-	// TryLock) while it may already be held on some paths.
+	// CategoryPossibleDeadlock is emitted when a lock is acquired while it may already be held on some paths.
 	CategoryPossibleDeadlock Category = "possible-deadlock"
 
 	// CategoryInvalidUnlock is emitted when Unlock or RUnlock is called on a
 	// lock that is not currently held (certain or possible).
 	CategoryInvalidUnlock Category = "invalid-unlock"
+
+	// CategoryPossiblyInvalidUnlock is emitted when Unlock or RUnlock is called on a
+	// lock that is not currently held (certain or possible).
+	CategoryPossiblyInvalidUnlock Category = "possible-invalid-unlock"
 
 	// CategoryInvalidAnnotation is emitted when a Lockguard annotation —
 	// a struct tag or a //lockguard: comment directive — cannot be parsed or
@@ -49,17 +48,6 @@ const (
 // analysis.Diagnostic values at the appropriate source position.
 type lockDiagnostic struct {
 	category Category
+	pos      token.Pos
 	message  string
-}
-
-// reportAll emits each diagnostic at pos via pass.Report, setting the Category
-// field so that consumers can classify findings without parsing message text.
-func reportAll(pass *analysis.Pass, pos token.Pos, diags []lockDiagnostic) {
-	for _, d := range diags {
-		pass.Report(analysis.Diagnostic{
-			Pos:      pos,
-			Category: string(d.category),
-			Message:  d.message,
-		})
-	}
 }

@@ -285,6 +285,58 @@ if t.mu1.TryLock() && t.mu2.TryLock() { ... }
 if t.mu1.TryLock() || t.mu2.TryLock() { ... }
 ```
 
+## Inline function literals
+
+An immediately-invoked function literal written as its own statement - `func() { ... }()` - is analyzed as if its body were spliced into the enclosing function. Locks it takes or releases on variables from the enclosing scope carry over to the code that follows it:
+
+```go
+func (s *Server) inlineLocks() {
+    func() {
+        s.mu.Lock() // 's.mu' acquired but never unlocked
+    }()
+    s.data++ // OK — s.mu is held; the lock flowed out of the literal
+}
+```
+
+If the literal releases what it took (for example with a `defer` inside it), the lock is correctly seen as released afterwards:
+
+```go
+func (s *Server) inlineLockUnlock() {
+    func() {
+        s.mu.Lock()
+        defer s.mu.Unlock()
+        s.data++ // OK
+    }()
+    s.data++ // writing 's.data' requires holding 's.mu' — released inside the literal
+}
+```
+
+Locks taken on variables **declared inside the literal** belong to the literal: they are leak-checked at the literal itself and do not affect the enclosing function:
+
+```go
+func useScratchLock() {
+    func() {
+        var mu sync.Mutex
+        mu.Lock() // 'mu' acquired but never unlocked
+    }()
+}
+```
+
+Each exit path of the literal is followed independently, so a lock taken on only some of its paths is reported as possibly held, exactly as for a plain `if`:
+
+```go
+func (s *Server) inlineConditional(cond bool) {
+    func() {
+        if cond {
+            s.mu.Lock()
+        }
+    }()
+    s.data++ // writing 's.data' requires holding 's.mu' (not held on all paths)
+} // 's.mu' may not be unlocked at function exit
+```
+
+This state continuation applies to statement-level literals only; see [Known limitations](#known-limitations) for literals nested inside larger expressions.
+
 ## Flags
 
 | Flag | Default | Description |
@@ -296,3 +348,4 @@ if t.mu1.TryLock() || t.mu2.TryLock() { ... }
 - **Struct literals**: field accesses inside composite literals are not yet checked.
 - **Cross-package facts**: protection facts are exported for use by other packages, but importing facts from dependencies is not yet implemented.
 - **Back edges / loops**: lock state is not propagated around loop back edges, so patterns like `for { mu.Lock() }` are not analyzed across iterations.
+- **In-expression function literals**: only statement-level immediately-invoked literals (`func() { ... }()` on their own line) have their lock effects flow into the enclosing function. A literal nested inside a larger expression — for example `x := compute(func() int { ... }())` or `y := a + func() int { ... }()` — is analyzed in isolation, so locks it takes on enclosing-scope variables do not carry over to the surrounding code. Leaks on the literal's own variables are still detected.

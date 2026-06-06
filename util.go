@@ -1,10 +1,12 @@
 package lockguard
 
 import (
+	"cmp"
 	"go/ast"
 	"go/types"
 	"iter"
 	"path"
+	"slices"
 	"strings"
 )
 
@@ -60,4 +62,60 @@ func nillOf[T any]() T {
 // Used when the assigned slice is different from the slice appended to.
 func copyAppend[T any](slice []T, elems ...T) []T {
 	return append(append([]T(nil), slice...), elems...)
+}
+
+func filterType[T any, E any](s []E) []T {
+	var result []T
+	for _, v := range s {
+		if t, ok := any(v).(T); ok {
+			result = append(result, t)
+		}
+	}
+	return result
+}
+
+func compareBy[E any, C cmp.Ordered](extractor func(e E) C) func(a, b E) int {
+	return func(a, b E) int {
+		aCmp := extractor(a)
+		bCmp := extractor(b)
+		if aCmp < bCmp {
+			return -1
+		} else if aCmp > bCmp {
+			return 1
+		} else {
+			return 0
+		}
+	}
+}
+
+func sortedBy[E any, C cmp.Ordered](s iter.Seq[E], extractor func(e E) C) []E {
+	return slices.SortedFunc(s, compareBy(extractor))
+}
+
+func allMatch[E any](els []E, f func(e E) bool) bool {
+	for _, e := range els {
+		if !f(e) {
+			return false
+		}
+	}
+	return true
+}
+
+func anyMatch[E any](els []E, f func(e E) bool) bool {
+	for _, e := range els {
+		if f(e) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchCount[E any](els []E, f func(e E) bool) int {
+	cnt := 0
+	for _, e := range els {
+		if f(e) {
+			cnt++
+		}
+	}
+	return cnt
 }

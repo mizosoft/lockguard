@@ -2,12 +2,13 @@ package lockguard
 
 import (
 	"fmt"
+	"go/token"
 	"go/types"
 	"slices"
 	"strings"
-
-	"golang.org/x/tools/go/cfg"
 )
+
+// TODO document the algorithm, and why we do canonicalization, etc.
 
 type lockOp int
 
@@ -42,48 +43,94 @@ func lockOpOf(name string) lockOp {
 	return noneLockOp
 }
 
-type deferredOp struct {
-	block *cfg.Block
-	path  canonicalPath
+type (
+	lockResult interface {
+		isUncertain() bool
+
+		isRLock() bool
+	}
+
+	baseLockResult struct {
+		uncertain bool
+		rlock     bool
+	}
+
+	acquiredLockResult struct {
+		baseLockResult
+		deadlock bool
+	}
+
+	releasedLockResult struct {
+		baseLockResult
+		invalid bool
+	}
+
+	leakResult struct {
+		baseLockResult
+		path       canonicalPath
+		acquirePos token.Pos
+	}
+)
+
+func (r baseLockResult) isRLock() bool {
+	return r.rlock
+}
+
+func (r baseLockResult) isUncertain() bool {
+	return r.uncertain
 }
 
 type lockScope struct {
-	trees           map[*cfg.Block]lockTree // Map's from CFG block IDs to the corresponding lockTree identifying lock states.
-	deferredApplies []canonicalPath
+	tree lockTree
 }
 
 func newLockScope() *lockScope {
 	return &lockScope{
-		trees: make(map[*cfg.Block]lockTree),
+		tree: lockTree{root: newNode(nil)},
 	}
 }
 
-func (s *lockScope) apply(block *cfg.Block, path canonicalPath) []lockDiagnostic {
+// fork returns an independent deep copy of this scope.
+func (s *lockScope) fork() *lockScope {
+	return &lockScope{
+		tree: lockTree{root: s.tree.root.copy()},
+	}
+}
+
+// detachOwned returns an independent copy of this scope with the roots owned by the predicate
+// removed. It is used at the exit of an inline function literal to drop locks on variables declared
+// inside the literal (out of scope in the caller, and already leak-checked at the literal), while
+// lock state on enclosing-scope roots is preserved and flows onward into the caller.
+func (s *lockScope) detachOwned(owned func(types.Object) bool) *lockScope {
+	ns := s.fork()
+	for obj, child := range ns.tree.root.children {
+		if owned(child.obj) {
+			delete(ns.tree.root.children, obj)
+		}
+	}
+	return ns
+}
+
+func (s *lockScope) apply(path canonicalPath, pos token.Pos) lockResult {
 	if !isLockOpPath(path) {
 		return nil
 	}
 
 	switch op := lockOpOf(path[len(path)-1].Name()); op {
 	case lockLockOp:
-		return s.lock(block, path[:len(path)-1], false)
+		return s.lock(path[:len(path)-1], false, pos)
 	case rLockLockOp:
-		return s.lock(block, path[:len(path)-1], true)
+		return s.lock(path[:len(path)-1], true, pos)
 	case unlockLockOp:
-		return s.unlock(block, path[:len(path)-1], false)
+		return s.unlock(path[:len(path)-1], false)
 	case rUnlockLockOp:
-		return s.unlock(block, path[:len(path)-1], true)
+		return s.unlock(path[:len(path)-1], true)
 	default:
 		panic("should've been checked by isLockOpPath to not be the case")
 	}
 }
 
-func (s *lockScope) lock(block *cfg.Block, path canonicalPath, isRLock bool) (diags []lockDiagnostic) {
-	tree, ok := s.trees[block]
-	if !ok {
-		tree = lockTree{newNode(nil)}
-		s.trees[block] = tree
-	}
-
+func (s *lockScope) lock(path canonicalPath, isRLock bool, pos token.Pos) acquiredLockResult {
 	var funcName string
 	if isRLock {
 		funcName = "RLock"
@@ -91,64 +138,70 @@ func (s *lockScope) lock(block *cfg.Block, path canonicalPath, isRLock bool) (di
 		funcName = "Lock"
 	}
 
-	pathWithLockFunc := copyAppend(path, locateFromObjByName(path[len(path)-1], funcName)...)
+	lockFuncPath := locateFromObjByName(path[len(path)-1], funcName)
+	if lockFuncPath == nil {
+		panic(fmt.Sprintf("expected '%s' to locate a lock", path))
+	}
 
-	treePath := tree.add(path)
+	pathWithLockFunc := copyAppend(path, lockFuncPath...)
+	treePath := s.tree.add(path)
+	result := acquiredLockResult{
+		baseLockResult: baseLockResult{
+			uncertain: false,
+			rlock:     isRLock,
+		},
+		deadlock: false,
+	}
 	for i := len(path) - 1; i >= 0; i-- {
-		// Check if the locking function is defined (directly or indirectly through embedded fields) by
-		// this object.
 		pathFromObj := locateFromObjByName(path[i], funcName)
 		if pathFromObj == nil {
-			return
+			return result
 		}
 		if !slices.Equal(pathWithLockFunc[i+1:], pathFromObj) {
-			return // Locking is not transferable as paths to the locking function starts diverging.
+			return result
 		}
 
 		kind := lockKindOfObject(path[i])
 		if kind == noneLockKind {
-			continue // Locking will only activate when we reach a lock object.
+			continue
 		}
 
 		nd := treePath[i]
 		if !isRLock && (kind == normalLockKind || kind == rwLockKind) {
 			if nd.certainLockCount >= 1 || nd.certainRLockCount >= 1 {
-				diags = append(diags, lockDiagnostic{CategoryDeadlock, fmt.Sprintf("acquiring '%v' that is already held [deadlock]", nd.obj.Name())})
-			} else if nd.possibleLockCount >= 1 || nd.possibleRLockCount >= 1 {
-				diags = append(diags, lockDiagnostic{CategoryDeadlock, fmt.Sprintf("acquiring '%v' that may be held [deadlock]", nd.obj.Name())})
+				result.deadlock = true
+			} else if nd.lockCount >= 1 || nd.rLockCount >= 1 {
+				result.deadlock = true
+				result.uncertain = true
 			}
+			nd.lockCount++
 			nd.certainLockCount++
-			nd.possibleLockCount++
+			nd.acquirePos = pos
 		} else if isRLock && kind == rwLockKind {
 			if nd.certainLockCount >= 1 {
-				diags = append(diags, lockDiagnostic{CategoryDeadlock, fmt.Sprintf("acquiring '%v' that is already held [deadlock]", nd.obj.Name())})
-			} else if nd.possibleLockCount >= 1 {
-				diags = append(diags, lockDiagnostic{CategoryDeadlock, fmt.Sprintf("acquiring '%v' that may be held [deadlock]", nd.obj.Name())})
+				result.deadlock = true
+			} else if nd.lockCount >= 1 {
+				result.deadlock = true
+				result.uncertain = true
 			}
+			nd.rLockCount++
 			nd.certainRLockCount++
-			nd.possibleRLockCount++
+			nd.acquirePos = pos
 		}
 
-		// Break if lock state is not transferable upwards.
 		switch obj := path[i].(type) {
 		case *types.Var:
 			if !obj.Embedded() {
-				return
+				return result
 			}
 		default:
-			return
+			return result
 		}
 	}
-	return
+	return result
 }
 
-func (s *lockScope) possibleLock(block *cfg.Block, path canonicalPath, isRLock bool) (diags []lockDiagnostic) {
-	tree, ok := s.trees[block]
-	if !ok {
-		tree = lockTree{newNode(nil)}
-		s.trees[block] = tree
-	}
-
+func (s *lockScope) lockUncertain(path canonicalPath, isRLock bool, pos token.Pos) acquiredLockResult {
 	var funcName string
 	if isRLock {
 		funcName = "RLock"
@@ -156,70 +209,77 @@ func (s *lockScope) possibleLock(block *cfg.Block, path canonicalPath, isRLock b
 		funcName = "Lock"
 	}
 
-	pathWithLockFunc := copyAppend(path, locateFromObjByName(path[len(path)-1], funcName)...)
+	lockFuncPath := locateFromObjByName(path[len(path)-1], funcName)
+	if lockFuncPath == nil {
+		panic(fmt.Sprintf("expected '%s' to locate a lock", path))
+	}
 
-	treePath := tree.add(path)
+	pathWithLockFunc := copyAppend(path, lockFuncPath...)
+	treePath := s.tree.add(path)
+	result := acquiredLockResult{
+		baseLockResult: baseLockResult{
+			rlock: isRLock,
+		},
+		deadlock: false,
+	}
 	for i := len(path) - 1; i >= 0; i-- {
-		// Check if the locking function is defined (directly or indirectly through embedded fields) by
-		// this object.
 		pathFromObj := locateFromObjByName(path[i], funcName)
 		if pathFromObj == nil {
-			return
+			return result
 		}
 		if !slices.Equal(pathWithLockFunc[i+1:], pathFromObj) {
-			return // Locking is not transferable as paths to the locking function starts diverging.
+			return result
 		}
 
 		kind := lockKindOfObject(path[i])
 		if kind == noneLockKind {
-			continue // Locking will only activate when we reach a lock object.
+			continue
 		}
 
 		nd := treePath[i]
 		if !isRLock && (kind == normalLockKind || kind == rwLockKind) {
 			if nd.certainLockCount >= 1 || nd.certainRLockCount >= 1 {
-				diags = append(diags, lockDiagnostic{CategoryPossibleDeadlock, fmt.Sprintf("acquiring '%v' that is already held [possible deadlock]", nd.obj.Name())})
-			} else if nd.possibleLockCount >= 1 || nd.possibleRLockCount >= 1 {
-				diags = append(diags, lockDiagnostic{CategoryPossibleDeadlock, fmt.Sprintf("acquiring '%v' that may be held [possible deadlock]", nd.obj.Name())})
+				result.deadlock = true
+			} else if nd.lockCount >= 1 || nd.rLockCount >= 1 {
+				result.deadlock = true
+				result.uncertain = true
 			}
-			nd.possibleLockCount++
+			nd.lockCount++
+			nd.acquirePos = pos
 		} else if isRLock && kind == rwLockKind {
 			if nd.certainLockCount >= 1 {
-				diags = append(diags, lockDiagnostic{CategoryPossibleDeadlock, fmt.Sprintf("acquiring '%v' that is already held [possible deadlock]", nd.obj.Name())})
-			} else if nd.possibleLockCount >= 1 {
-				diags = append(diags, lockDiagnostic{CategoryPossibleDeadlock, fmt.Sprintf("acquiring '%v' that may be held [possible deadlock]", nd.obj.Name())})
+				result.deadlock = true
+			} else if nd.lockCount >= 1 {
+				result.deadlock = true
+				result.uncertain = true
 			}
-			nd.possibleRLockCount++
+			nd.rLockCount++
+			nd.acquirePos = pos
 		}
 
-		// Break if lock state is not transferable upwards.
 		switch obj := path[i].(type) {
 		case *types.Var:
 			if !obj.Embedded() {
-				return
+				return result
 			}
 		default:
-			return
+			return result
 		}
 	}
-	return
+	return result
 }
 
-func (s *lockScope) unlock(block *cfg.Block, path canonicalPath, isRLock bool) (diags []lockDiagnostic) {
-	tree, ok := s.trees[block]
+func (s *lockScope) unlock(path canonicalPath, isRLock bool) releasedLockResult {
+	treePath := s.tree.follow(path)
 
-	var treePath []*node
-	if ok {
-		treePath = tree.follow(path)
-	}
-
-	if len(treePath) == 0 {
-		if isRLock {
-			diags = append(diags, lockDiagnostic{CategoryInvalidUnlock, fmt.Sprintf("releasing read lock on '%v' that is not held", path[len(path)-1].Name())})
-		} else {
-			diags = append(diags, lockDiagnostic{CategoryInvalidUnlock, fmt.Sprintf("releasing '%v' that is not held", path[len(path)-1].Name())})
+	if len(treePath) != len(path) {
+		return releasedLockResult{
+			baseLockResult: baseLockResult{
+				uncertain: false,
+				rlock:     isRLock,
+			},
+			invalid: true,
 		}
-		return
 	}
 
 	var funcName string
@@ -229,192 +289,152 @@ func (s *lockScope) unlock(block *cfg.Block, path canonicalPath, isRLock bool) (
 		funcName = "Unlock"
 	}
 
-	pathWithUnlockFunc := copyAppend(path, locateFromObjByName(path[len(path)-1], funcName)...)
+	unlockFuncPath := locateFromObjByName(path[len(path)-1], funcName)
+	if unlockFuncPath == nil {
+		panic(fmt.Sprintf("expected '%s' to locate a lock", path))
+	}
 
+	pathWithUnlockFunc := copyAppend(path, unlockFuncPath...)
+	var result releasedLockResult
+	result.rlock = isRLock
+	var resultSet bool
 	for i := len(path) - 1; i >= 0; i-- {
-		// Check if the locking function is defined (directly or indirectly through embedded fields) by
-		// this object.
 		pathFromObj := locateFromObjByName(path[i], funcName)
 		if pathFromObj == nil {
-			return
+			return result
 		}
 		if !slices.Equal(pathWithUnlockFunc[i+1:], pathFromObj) {
-			return // Unlocking is not transferable as paths to the unlocking function starts diverging.
+			return result
 		}
 
 		kind := lockKindOfObject(path[i])
 		if kind == noneLockKind {
-			continue // Unlocking will only activate when we reach a lock object.
+			continue
 		}
 
 		nd := treePath[i]
+		localResult := releasedLockResult{
+			baseLockResult: baseLockResult{
+				rlock: isRLock,
+			},
+		}
 		if !isRLock {
 			if nd.certainLockCount <= 0 {
-				if nd.possibleLockCount > 0 {
-					diags = append(diags, lockDiagnostic{CategoryInvalidUnlock, fmt.Sprintf("releasing '%v' that may not be held", nd.obj.Name())})
-					nd.possibleLockCount--
-				} else {
-					diags = append(diags, lockDiagnostic{CategoryInvalidUnlock, fmt.Sprintf("releasing '%v' that is not held", nd.obj.Name())})
+				localResult.invalid = true
+				if nd.lockCount > 0 { // Unlock is only valid on some paths.
+					localResult.uncertain = true
+					nd.lockCount--
 				}
 			} else {
 				nd.certainLockCount--
-				nd.possibleLockCount--
+				nd.lockCount--
 			}
 		} else if nd.certainRLockCount <= 0 {
-			if nd.possibleRLockCount > 0 {
-				diags = append(diags, lockDiagnostic{CategoryInvalidUnlock, fmt.Sprintf("releasing read lock on '%v' that may not be held", nd.obj.Name())})
-				nd.possibleRLockCount--
-			} else {
-				diags = append(diags, lockDiagnostic{CategoryInvalidUnlock, fmt.Sprintf("releasing read lock on '%v' that is not held", nd.obj.Name())})
+			localResult.invalid = true
+			if nd.rLockCount > 0 { // RUnlock is only valid on some paths.
+				localResult.uncertain = true
+				nd.rLockCount--
 			}
 		} else {
 			nd.certainRLockCount--
-			nd.possibleRLockCount--
+			nd.rLockCount--
 		}
 
-		// Break if lock state is not transferable upwards.
+		if !resultSet {
+			result = localResult
+			resultSet = true
+		} else if result != localResult {
+			panic(fmt.Sprintf("expected %v to be equal to %v (different lockResults on the same lock path", localResult, result))
+		}
+
 		switch obj := path[i].(type) {
 		case *types.Var:
 			if !obj.Embedded() {
-				return
+				return result
 			}
 		default:
-			return
+			return result
 		}
 	}
-	return
+	return result
 }
 
-func (s *lockScope) merge(src *cfg.Block, dst *cfg.Block) {
-	srcTree := s.trees[src]
-	if srcTree.root == nil {
-		srcTree.root = newNode(nil) // Assume this is an empty tree.
+// closePath returns the locks still held at this exit point that the owned predicate selects
+// used for leak detection. The predicate decides which roots (first-level variables) belong to the
+// exiting function: a top-level function owns everything, while an inline function literal owns only the
+// variables declared inside it. This isolates leak detection for inline literals; they inherit the
+// enclosing held-lock state (so protection checks still pass) but only report leaks on their own
+// variables, not locks held by the enclosing function (which flow onward and are reported there).
+func (s *lockScope) closePath(owned func(types.Object) bool) []leakResult {
+	if s.tree.root == nil {
+		return nil
 	}
 
-	if dstTree, ok := s.trees[dst]; ok {
-		dstTree.root.mergeFrom(srcTree.root)
-	} else {
-		s.trees[dst] = lockTree{srcTree.root.copy()}
-	}
-}
-
-// Applies a lock/unlock operation in a deferred manner,
-func (s *lockScope) applyDeferred(path canonicalPath) {
-	if !isLockOpPath(path) {
-		return
-	}
-	s.deferredApplies = append(s.deferredApplies, path)
-}
-
-// Closes this scope by applying deferred operations & detecting lock leaks from given exit scpoes.
-func (s *lockScope) close(exitBlocks []*cfg.Block) (diag []lockDiagnostic) {
-	for _, block := range exitBlocks {
-		for _, entry := range s.deferredApplies {
-			s.apply(block, entry)
+	var leaks []leakResult
+	for _, child := range s.tree.root.children {
+		if owned(child.obj) {
+			leaks = append(leaks, collectHeldLocks(child, nil)...)
 		}
 	}
-	s.deferredApplies = nil
-
-	// Report any locks still held at each exit point.
-	// Each exit block that holds a lock emits its own diagnostic, so callers
-	// can see exactly how many distinct exit paths leave the lock unreleased.
-	var diags []lockDiagnostic
-	for _, exitBlock := range exitBlocks {
-		tree, ok := s.trees[exitBlock]
-		if !ok || tree.root == nil {
-			continue
-		}
-		diags = append(diags, collectHeldLocks(tree.root, nil)...)
-	}
-	return diags
+	return leaks
 }
 
-func collectHeldLocks(root *node, path canonicalPath) []lockDiagnostic {
-	var diags []lockDiagnostic
-	if root.obj != nil {
-		path = append(path, root.obj)
-		if lockKindOfObject(root.obj) != noneLockKind && root.certainLockCount+root.certainRLockCount+root.possibleLockCount+root.possibleRLockCount > 0 {
-			name := path.String()
-			if root.certainLockCount > 0 || root.possibleLockCount > 0 {
-				var msg string
-				if root.certainLockCount > 0 {
-					msg = fmt.Sprintf("'%s' held at function exit (lock leak)", name)
-				} else {
-					msg = fmt.Sprintf("'%s' possibly held at function exit (possible lock leak)", name)
-				}
-				diags = append(diags, lockDiagnostic{CategoryLockedAtExit, msg})
-			}
-			if root.certainRLockCount > 0 || root.possibleRLockCount > 0 {
-				var msg string
-				if root.certainRLockCount > 0 {
-					msg = fmt.Sprintf("read lock on '%s' held at function exit (lock leak)", name)
-				} else {
-					msg = fmt.Sprintf("read lock on '%s' possibly held at function exit (possible lock leak)", name)
-				}
-				diags = append(diags, lockDiagnostic{CategoryLockedAtExit, msg})
-			}
-		}
-	}
-
-	for _, child := range root.children {
-		diags = append(diags, collectHeldLocks(child, path)...)
-	}
-	return diags
+type missingProtection struct {
+	protection
+	uncertain bool
 }
 
-func (s *lockScope) checkProtections(source *cfg.Block, objectPath canonicalPath, prots []protection, access accessKind) (diags []lockDiagnostic) {
-	if len(objectPath) == 0 {
-		return nil // Vacuously
+func (s *lockScope) checkProtections(path canonicalPath, access accessKind, prots []protection) (missingProtections []missingProtection) {
+	if len(path) == 0 {
+		return nil
 	}
 
-	var verb string
-	if access == writeAccessKind {
-		verb = "writing"
-	} else {
-		verb = "reading"
-	}
-	field := "'" + objectPath.String() + "'"
-
-	// lockPaths resolves each protection's lock relative to the object's prefix
-	// and returns the full dot-joined path strings (e.g. "s.mu", "b.GlobalMut").
-	lockPaths := func(ps []protection) []string {
-		names := make([]string, len(ps))
-		for i, p := range ps {
-			names[i] = canonicalPath(copyAppend(objectPath[:len(objectPath)-1], p.lockPath...)).String()
-		}
-		return names
-	}
-
-	tree, ok := s.trees[source]
-	if !ok {
-		return []lockDiagnostic{{CategoryMissingLock, fmt.Sprintf("%s %s requires holding %s", verb, field, formatLocks(lockPaths(prots)))}}
-	}
-
-	var missedProts []protection
-	var possiblyMissedProts []protection
 	for _, prot := range prots {
-		lockPath := copyAppend(objectPath[:len(objectPath)-1], prot.lockPath...)
-		treePath := tree.follow(lockPath)
+		lockPath := copyAppend(path[:len(path)-1], prot.lockPath...)
+		treePath := s.tree.follow(lockPath)
 		if len(lockPath) != len(treePath) {
-			missedProts = append(missedProts, prot)
-		} else if nd := treePath[len(treePath)-1]; (nd.possibleLockCount <= 0 && nd.possibleRLockCount <= 0) || !prot.directive.isSatisfiedBy(lockKindOfObject(nd.obj), nd.possibleLockCount == 0, access) {
-			missedProts = append(missedProts, prot)
-		} else if (nd.certainLockCount <= 0 && nd.certainRLockCount <= 0) || !prot.directive.isSatisfiedBy(lockKindOfObject(nd.obj), nd.certainLockCount == 0, access) {
-			possiblyMissedProts = append(possiblyMissedProts, prot)
+			missingProtections = append(missingProtections, missingProtection{
+				protection: prot,
+				uncertain:  false,
+			})
+		} else {
+			// TODO, we might want to add more reasoning as to why the protection is missing, and why it is not missing
+			//       but it is uncertain.
+			nd := treePath[len(treePath)-1]
+			if nd.lockCount <= 0 && nd.rLockCount <= 0 {
+				// Lock is not even possibly held.
+				missingProtections = append(missingProtections, missingProtection{
+					protection: prot,
+					uncertain:  false,
+				})
+			} else if isRLock := nd.lockCount == 0; !prot.directive.isSatisfiedBy(lockKindOfObject(nd.obj), isRLock, access) {
+				// Lock is possibly held, but this possibility doesn't satisfy the directive.
+				missingProtections = append(missingProtections, missingProtection{
+					protection: prot,
+					uncertain:  false,
+				})
+			} else if nd.certainLockCount <= 0 && nd.certainRLockCount <= 0 {
+				// Lock is possibly held, and this possibility satisfies the directive, but there is no certainty in that
+				// possibility, therefore the protection is possibly missing.
+				missingProtections = append(missingProtections, missingProtection{
+					protection: prot,
+					uncertain:  true,
+				})
+			} else if !prot.directive.isSatisfiedBy(lockKindOfObject(nd.obj), nd.certainLockCount == 0, access) {
+				// Lock is possibly held, this possibility satisfies the directive, and there is certainty in that
+				// possibility, but that certainty doesn't satisfy the directive, therefore the protection is
+				// possibly missing.
+				missingProtections = append(missingProtections, missingProtection{
+					protection: prot,
+					uncertain:  true,
+				})
+			}
 		}
-	}
-
-	if len(missedProts) > 0 {
-		diags = append(diags, lockDiagnostic{CategoryMissingLock, fmt.Sprintf("%s %s requires holding %s", verb, field, formatLocks(lockPaths(missedProts)))})
-	}
-	if len(possiblyMissedProts) > 0 {
-		diags = append(diags, lockDiagnostic{CategoryPossiblyMissingLock, fmt.Sprintf("%s %s requires holding %s (not held on all paths)", verb, field, formatLocks(lockPaths(possiblyMissedProts)))})
 	}
 	return
 }
 
-// formatLocks joins quoted lock names, e.g. "'mu'" or "'mu1' and 'mu2'" or "'mu1', 'mu2' and 'mu3'".
-func formatLocks(names []string) string {
+func formatLockNames(names []string) string {
 	quoted := make([]string, len(names))
 	for i, name := range names {
 		quoted[i] = "'" + name + "'"
@@ -445,12 +465,12 @@ func isLockOpPath(path canonicalPath) bool {
 		return false
 	}
 
-	// Check there's at least one Lock or RLock node from the end and that op is transferable through the
+	// Check there's at least one Lock or RLock node from the end and that lockOp is transferable through the
 	// remaining suffix to that node.
 	for i := len(path) - 2; i >= 0; i-- {
 		pathToOp := locateFromObjByName(path[i], op.funcName())
 		if !slices.Equal(path[i+1:], pathToOp) {
-			return false
+			return false // Locker's `op.funcName()` doesn't follow the same path given to us.
 		}
 
 		kind := lockKindOfObject(path[i])
@@ -472,10 +492,7 @@ func (t lockTree) add(path canonicalPath) []*node {
 		if next, ok := curr.children[obj]; ok {
 			curr = next
 		} else {
-			next = &node{
-				children: make(map[types.Object]*node),
-				obj:      obj,
-			}
+			next = newNode(obj)
 			curr.children[obj] = next
 			curr = next
 		}
@@ -508,7 +525,7 @@ func (t lockTree) print() {
 		n := q[0]
 		q = q[1:]
 
-		fmt.Printf("%v - <%d, %d, %d, %d>\n", n.obj, n.certainLockCount, n.certainRLockCount, n.possibleLockCount, n.possibleRLockCount)
+		fmt.Printf("%v - <%d, %d, %d, %d>\n", n.obj, n.certainLockCount, n.certainRLockCount, n.lockCount, n.rLockCount)
 		for obj, c := range n.children {
 			fmt.Printf("%v -> %v\n", n.obj, obj)
 			q = append(q, c)
@@ -517,16 +534,24 @@ func (t lockTree) print() {
 	}
 }
 
-func (s *lockScope) print(block *cfg.Block) {
-	s.trees[block].print()
+func (s *lockScope) print() {
+	s.tree.print()
 	fmt.Println()
 }
 
 type node struct {
-	children                              map[types.Object]*node
-	obj                                   types.Object // Node object, nil for root.
-	certainLockCount, certainRLockCount   int
-	possibleLockCount, possibleRLockCount int
+	children map[types.Object]*node
+	obj      types.Object
+
+	// Counts for the number of times the lock is held, either certainly or only possibly (e.g. an uncertain TryLock).
+	// In correct code, either both counts are zero, or lockCount is 1 and rLockCount is 0, or lockCount is 0 and
+	// rLockCount is > 0. Otherwise, we'll generate warnings.
+	lockCount, rLockCount int
+
+	// The subset of lockCount and rLockCount that is certain.
+	certainLockCount, certainRLockCount int
+
+	acquirePos token.Pos
 }
 
 func newNode(obj types.Object) *node {
@@ -538,37 +563,45 @@ func newNode(obj types.Object) *node {
 
 func (n *node) copy() *node {
 	dst := newNode(n.obj)
-	dst.certainLockCount, dst.certainRLockCount, dst.possibleLockCount, dst.possibleRLockCount =
-		n.certainLockCount, n.certainRLockCount, n.possibleLockCount, n.possibleRLockCount
+	dst.certainLockCount, dst.certainRLockCount, dst.lockCount, dst.rLockCount =
+		n.certainLockCount, n.certainRLockCount, n.lockCount, n.rLockCount
+	dst.acquirePos = n.acquirePos
 	for obj, child := range n.children {
 		dst.children[obj] = child.copy()
 	}
 	return dst
 }
 
-func (n *node) mergeFrom(src *node) {
-	if n.obj != src.obj {
-		panic("merging nodes of different objects")
-	}
+func collectHeldLocks(root *node, path canonicalPath) (leaks []leakResult) {
+	if root.obj != nil {
+		path = append(path, root.obj)
+		if lockKindOfObject(root.obj) != noneLockKind && root.lockCount+root.rLockCount > 0 {
+			if root.lockCount > 0 {
+				leaks = append(leaks, leakResult{
+					baseLockResult: baseLockResult{
+						uncertain: root.certainLockCount == 0,
+						rlock:     false,
+					},
+					path:       path,
+					acquirePos: root.acquirePos,
+				})
+			}
 
-	n.certainLockCount, n.certainRLockCount = min(n.certainLockCount, src.certainLockCount), min(n.certainRLockCount, src.certainRLockCount)
-	n.possibleLockCount, n.possibleRLockCount = max(n.possibleLockCount, src.possibleLockCount), max(n.possibleRLockCount, src.possibleRLockCount)
-
-	// Merge src children into dst.
-	for obj, srcChild := range src.children {
-		if dstChild, ok := n.children[obj]; ok {
-			dstChild.mergeFrom(srcChild)
-		} else {
-			dstChild = newNode(srcChild.obj)
-			dstChild.mergeFrom(srcChild)
-			n.children[obj] = dstChild
+			if root.rLockCount > 0 {
+				leaks = append(leaks, leakResult{
+					baseLockResult: baseLockResult{
+						uncertain: root.certainRLockCount == 0,
+						rlock:     true,
+					},
+					path:       path,
+					acquirePos: root.acquirePos,
+				})
+			}
 		}
 	}
 
-	// Handle dst children that don't exist in src - merge with empty state.
-	for obj, dstChild := range n.children {
-		if _, exists := src.children[obj]; !exists {
-			dstChild.mergeFrom(newNode(obj)) // Merge with empty node.
-		}
+	for _, child := range root.children {
+		leaks = append(leaks, collectHeldLocks(child, path)...)
 	}
+	return
 }

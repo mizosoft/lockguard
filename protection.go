@@ -104,14 +104,14 @@ type protectionsFinder struct {
 	pass        *analysis.Pass
 }
 
-func newFinder(pass *analysis.Pass) protectionsFinder {
-	return protectionsFinder{
+func newFinder(pass *analysis.Pass) *protectionsFinder {
+	return &protectionsFinder{
 		protections: make(map[types.Object][]protection),
 		pass:        pass,
 	}
 }
 
-func (f *protectionsFinder) find(ins *inspector.Inspector) {
+func (f *protectionsFinder) find(ins *inspector.Inspector) map[types.Object][]protection {
 	ins.Root().Inspect([]ast.Node{(*ast.StructType)(nil), (*ast.GenDecl)(nil), (*ast.FuncDecl)(nil)},
 		func(c inspector.Cursor) bool {
 			var file *ast.File
@@ -134,6 +134,7 @@ func (f *protectionsFinder) find(ins *inspector.Inspector) {
 			}
 			return true
 		})
+	return f.protections
 }
 
 func (f *protectionsFinder) enclosingScopeOf(c inspector.Cursor) *types.Scope {
@@ -192,7 +193,7 @@ func (f *protectionsFinder) findStructProtections(typ *ast.StructType, spec *ast
 				for _, name := range field.Names {
 					if vr, ok := f.pass.TypesInfo.ObjectOf(name).(*types.Var); vr != nil && ok {
 						f.protections[vr] = prots
-						if debug {
+						if verbose {
 							fmt.Println(vr, "protected by", fmt.Sprintf("%v", f.protections[vr]))
 						}
 
@@ -209,7 +210,7 @@ func (f *protectionsFinder) findStructProtections(typ *ast.StructType, spec *ast
 				name := nameOfEmbeddedField(field.Type)
 				if vr, ok := f.pass.TypesInfo.ObjectOf(name).(*types.Var); vr != nil && ok {
 					f.protections[vr] = prots
-					if debug {
+					if verbose {
 						fmt.Println(vr, "protected by", fmt.Sprintf("%v", f.protections[vr]))
 					}
 
@@ -271,7 +272,7 @@ func (f *protectionsFinder) findFuncProtections(funcType *ast.FuncDecl, file *as
 
 	// Export protection info as a fact to other packages.
 	if len(f.protections[fnc]) > 0 {
-		if debug {
+		if verbose {
 			fmt.Println(fnc, "protected by", fmt.Sprintf("%v", f.protections[fnc]))
 		}
 
@@ -324,7 +325,7 @@ func (f *protectionsFinder) findVarDeclProtections(decl *ast.GenDecl, file *ast.
 			for _, name := range spec.Names {
 				if vr, ok := f.pass.TypesInfo.ObjectOf(name).(*types.Var); ok {
 					f.protections[vr] = specProts
-					if debug {
+					if verbose {
 						fmt.Println(vr, "protected by", fmt.Sprintf("%v", specProts))
 					}
 

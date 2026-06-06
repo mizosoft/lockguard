@@ -28,7 +28,7 @@ func (c *controlFlow) lockInBranch(cond bool) {
 		// Currently lockguard can't know what cond implies from above.
 		c.mu.Unlock() // want `releasing 'mu' that may not be held`
 	}
-} // want `'c\.mu' possibly held at function exit \(possible lock leak\)`
+} // want `'c\.mu' may not be unlocked at function exit`
 
 func (c *controlFlow) lockBeforeBranch(cond bool) {
 	c.mu.Lock()
@@ -254,8 +254,8 @@ func (d *deferTest) deferWithEarlyReturn(cond bool) {
 
 func (d *deferTest) multipleDeferUnlocks() {
 	d.mu.Lock()
+	defer d.mu.Unlock() // want `releasing 'mu' that is not held`
 	defer d.mu.Unlock()
-	defer d.mu.Unlock() // Double unlock - runtime error but not our concern
 
 	d.x++ // OK
 }

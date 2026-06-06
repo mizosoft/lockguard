@@ -1,6 +1,9 @@
 package a
 
-import "sync"
+import (
+	"math/rand"
+	"sync"
+)
 
 // ============================================================================
 // Lock-leak detection: locks that are held at function exit
@@ -17,9 +20,9 @@ type leakTest struct {
 
 // Lock acquired but never released.
 func (l *leakTest) simpleLeak() {
-	l.mu.Lock()
-	l.data++ // OK
-} // want `'l\.mu' held at function exit \(lock leak\)`
+	l.mu.Lock() // want `'l\.mu' acquired but never unlocked`
+	l.data++    // OK
+}
 
 // No lock — no leak warning (only an access warning).
 func (l *leakTest) noLock() {
@@ -44,14 +47,14 @@ func (l *leakTest) noLeakDefer() {
 // Early-return paths
 // ============================================================================
 
-// Lock leaked on all early-return paths.
+// Lock leaked on the early-return path, but released on the normal path.
 func (l *leakTest) earlyReturnLeak(cond bool) {
 	l.mu.Lock()
 	if cond {
 		return // lock still held → leak
 	}
 	l.mu.Unlock()
-} // want `'l\.mu' held at function exit \(lock leak\)`
+} // want `'l\.mu' may not be unlocked at function exit`
 
 // Deferred unlock covers all paths — no warning.
 func (l *leakTest) earlyReturnDeferred(cond bool) {
@@ -73,15 +76,15 @@ type rwLeakTest struct {
 
 // Read-lock acquired but never released.
 func (r *rwLeakTest) readLockLeak() {
-	r.mu.RLock()
-	_ = r.data // OK
-} // want `read lock on 'r\.mu' held at function exit \(lock leak\)`
+	r.mu.RLock() // want `read lock on 'r\.mu' acquired but never unlocked`
+	_ = r.data   // OK
+}
 
 // Write-lock acquired but never released.
 func (r *rwLeakTest) writeLockLeak() {
-	r.mu.Lock()
+	r.mu.Lock() // want `'r\.mu' acquired but never unlocked`
 	r.data++
-} // want `'r\.mu' held at function exit \(lock leak\)`
+}
 
 // Proper RLock/RUnlock — no warning.
 func (r *rwLeakTest) noReadLockLeak() {
@@ -89,3 +92,31 @@ func (r *rwLeakTest) noReadLockLeak() {
 	defer r.mu.RUnlock()
 	_ = r.data
 }
+
+func (s *S1) conditionalDeferredUnlock() {
+	s.mut.Lock()
+	defer func() {
+		if rand.Int() == 1 {
+			s.mut.Unlock()
+		}
+	}()
+	s.i++
+} // want `'s\.mut' may not be unlocked at function exit`
+
+func (s *S1) conditionalDeferredUnlockWithBranches() {
+	s.mut.Lock()
+	if true {
+		defer func() {
+			if rand.Int() == 1 {
+				s.mut.Unlock()
+			}
+		}()
+	} else {
+		defer func() {
+			if rand.Int() == 3 {
+				s.mut.Unlock()
+			}
+		}()
+	}
+	s.i++
+} // want `'s\.mut' may not be unlocked at function exit`

@@ -43,8 +43,8 @@ func globalFunc2() {
 }
 
 func globalWith2Locks() {
-	globalJ++     // want `writing 'globalJ' requires holding 'globalMut' and 'b\.GlobalMut'`
-	globalFunc2() // want `reading 'globalFunc2' requires holding 'globalMut' and 'b\.GlobalMut'`
+	globalJ++     // want `writing 'globalJ' requires holding 'b\.GlobalMut' and 'globalMut'`
+	globalFunc2() // want `reading 'globalFunc2' requires holding 'b\.GlobalMut' and 'globalMut'`
 
 	globalMut.Lock()
 	globalJ++     // want `writing 'globalJ' requires holding 'b\.GlobalMut'`
