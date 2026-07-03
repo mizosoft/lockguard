@@ -5,6 +5,7 @@ import (
 	"go/token"
 	"go/types"
 	"log"
+	"strings"
 
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/inspect"
@@ -37,14 +38,10 @@ func run(pass *analysis.Pass) (interface{}, error) {
 	// Skip runtime and internal packages: they can have very complex control flow
 	// (e.g. runtime.mallocgc) that causes exponential DFS path exploration, and
 	// they never contain lockguard annotations.
-	//pkgPath := pass.Pkg.Path()
-	//if pkgPath == "runtime" || strings.HasPrefix(pkgPath, "runtime/") ||
-	//	pkgPath == "internal" || strings.HasPrefix(pkgPath, "internal/") ||
-	//	pkgPath == "unsafe" {
-	//	return nil, nil
-	//}
-
-	if pass.Pkg.Name() != "a" {
+	pkgPath := pass.Pkg.Path()
+	if pkgPath == "runtime" || strings.HasPrefix(pkgPath, "runtime/") ||
+		pkgPath == "internal" || strings.HasPrefix(pkgPath, "internal/") ||
+		pkgPath == "unsafe" {
 		return nil, nil
 	}
 
@@ -65,27 +62,6 @@ func run(pass *analysis.Pass) (interface{}, error) {
 			Category: string(diag.category),
 		})
 	}
-
-	//if pass.Pkg.Name() != "c" {
-	//  return nil, nil
-	//}
-	//
-	//ins.Preorder([]ast.Node{(*ast.FuncDecl)(nil)}, func(n ast.Node) {
-	//  funcDecl := n.(*ast.FuncDecl)
-	//  fmt.Println(funcDecl)
-	//  if funcDecl.Body != nil {
-	//    g := cfg.New(funcDecl.Body, func(expr *ast.CallExpr) bool {
-	//      return true
-	//    })
-	//
-	//    for _, b := range g.Blocks {
-	//      fmt.Println(b.Kind)
-	//      for _, n := range b.Nodes {
-	//        fmt.Println(reflect.TypeOf(n))
-	//      }
-	//    }
-	//  }
-	//})
 
 	return nil, nil
 }
