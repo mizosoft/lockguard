@@ -116,9 +116,7 @@ type lockAnalyzer struct {
 	nodeStack          []ast.Node
 	accessStack        []accessKind
 	pass               *analysis.Pass
-	cursor             inspector.Cursor
 	blocks             []*cfg.Block
-	analyzingBodies    map[*ast.BlockStmt]bool
 	cpCoder            *canonicalPathCoder
 	eventRecorder      *eventRecorder
 	deferredCallsStack [][][]any

@@ -55,7 +55,3 @@ func (p *valueParser) skipWhiteSpace() {
 func (p *valueParser) done() bool {
 	return p.pos == len(p.s)
 }
-
-func (p *valueParser) remaining() string {
-	return p.s[p.pos:]
-}

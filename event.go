@@ -38,14 +38,6 @@ type accessEvent struct {
 	missingProtections []missingProtection
 }
 
-type lockEvent interface {
-	event
-
-	isUncertain() bool
-
-	isRLock() bool
-}
-
 type baseLockEvent struct {
 	baseEvent
 	uncertain bool

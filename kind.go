@@ -3,7 +3,6 @@ package lockguard
 import (
 	"go/token"
 	"go/types"
-	"strconv"
 )
 
 type lockKind int
@@ -20,32 +19,6 @@ func (kind lockKind) String() string {
 		rwLockKind:     "RWLock",
 		normalLockKind: "Lock",
 	}[kind]
-}
-
-func (kind lockKind) isLocking(funcName string) bool {
-	switch kind {
-	case rwLockKind:
-		return funcName == "Lock" || funcName == "RLock"
-	case normalLockKind:
-		return funcName == "Lock"
-	case noneLockKind:
-		return false
-	default:
-		panic("unknown lock kind " + strconv.Itoa(int(kind)))
-	}
-}
-
-func (kind lockKind) isUnlocking(funcName string) bool {
-	switch kind {
-	case rwLockKind:
-		return funcName == "Unlock" || funcName == "RUnlock"
-	case normalLockKind:
-		return funcName == "Unlock"
-	case noneLockKind:
-		return false
-	default:
-		panic("unknown lock kind " + strconv.Itoa(int(kind)))
-	}
 }
 
 func lockKindOfObject(lockObj types.Object) lockKind {
