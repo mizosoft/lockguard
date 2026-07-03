@@ -82,6 +82,16 @@ func (r baseLockResult) isUncertain() bool {
 
 type lockScope struct {
 	tree lockTree
+
+	// Lock-wrapper allowances. A type that implements sync.Locker (or the RW variant) exposes
+	// Lock/Unlock methods whose whole job is to acquire or release a lock across the call boundary:
+	// Lock() leaves a lock held at return (looks like a leak) and Unlock() releases a lock that was
+	// never taken in this frame (looks like an invalid unlock). When analyzing such a method we grant
+	// a one-shot allowance so that single expected imbalance is not reported. The fields live on the
+	// scope so they fork per DFS path along with the lock state.
+	leakAllowance           int  // suppress this many still-held locks at exit (Lock/RLock methods)
+	leakAllowanceRLock      bool // the allowed leak is a read lock (RLock) rather than a write lock (Lock)
+	invalidReleaseAllowance int  // treat this many not-held releases as valid (Unlock/RUnlock methods)
 }
 
 func newLockScope() *lockScope {
@@ -93,7 +103,10 @@ func newLockScope() *lockScope {
 // fork returns an independent deep copy of this scope.
 func (s *lockScope) fork() *lockScope {
 	return &lockScope{
-		tree: lockTree{root: s.tree.root.copy()},
+		tree:                    lockTree{root: s.tree.root.copy()},
+		leakAllowance:           s.leakAllowance,
+		leakAllowanceRLock:      s.leakAllowanceRLock,
+		invalidReleaseAllowance: s.invalidReleaseAllowance,
 	}
 }
 
@@ -273,12 +286,19 @@ func (s *lockScope) unlock(path canonicalPath, isRLock bool) releasedLockResult 
 	treePath := s.tree.follow(path)
 
 	if len(treePath) != len(path) {
+		// The lock isn't held anywhere in this frame. Normally an invalid release, but an unlocking
+		// method of a Locker type is allowed one such release (it unlocks on the caller's behalf).
+		invalid := true
+		if s.invalidReleaseAllowance > 0 {
+			s.invalidReleaseAllowance--
+			invalid = false
+		}
 		return releasedLockResult{
 			baseLockResult: baseLockResult{
 				uncertain: false,
 				rlock:     isRLock,
 			},
-			invalid: true,
+			invalid: invalid,
 		}
 	}
 
@@ -376,6 +396,18 @@ func (s *lockScope) closePath(owned func(types.Object) bool) []leakResult {
 			leaks = append(leaks, collectHeldLocks(child, nil)...)
 		}
 	}
+
+	// A locking method of a Locker type (e.g. (*RWMutex).Lock) is expected to leave one lock held at
+	// return. Drop that single expected leak, preferring one whose kind (read vs write) matches the
+	// method so an RLock method doesn't consume a write-lock leak and vice versa.
+	for allowance := s.leakAllowance; allowance > 0 && len(leaks) > 0; allowance-- {
+		idx := slices.IndexFunc(leaks, func(l leakResult) bool { return l.rlock == s.leakAllowanceRLock })
+		if idx < 0 {
+			idx = 0
+		}
+		leaks = slices.Delete(leaks, idx, idx+1)
+	}
+
 	return leaks
 }
 

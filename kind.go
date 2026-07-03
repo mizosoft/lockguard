@@ -21,6 +21,33 @@ func (kind lockKind) String() string {
 	}[kind]
 }
 
+// isLocking reports whether funcName is a lock-acquiring method for this lock kind
+// (Lock/TryLock for a plain Locker; additionally RLock/TryRLock for an RWLocker).
+func (kind lockKind) isLocking(funcName string) bool {
+	switch kind {
+	case rwLockKind:
+		return funcName == "Lock" || funcName == "RLock" ||
+				funcName == "TryLock" || funcName == "TryRLock"
+	case normalLockKind:
+		return funcName == "Lock" || funcName == "TryLock"
+	default:
+		return false
+	}
+}
+
+// isUnlocking reports whether funcName is a lock-releasing method for this lock kind
+// (Unlock for a plain Locker; Unlock or RUnlock for an RWLocker).
+func (kind lockKind) isUnlocking(funcName string) bool {
+	switch kind {
+	case rwLockKind:
+		return funcName == "Unlock" || funcName == "RUnlock"
+	case normalLockKind:
+		return funcName == "Unlock"
+	default:
+		return false
+	}
+}
+
 func lockKindOfObject(lockObj types.Object) lockKind {
 	var typ types.Type
 	var isFunc bool

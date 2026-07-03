@@ -297,6 +297,21 @@ func (l *lockAnalyzer) analyzeCfg(stmt *ast.BlockStmt, onExit func()) {
 				l.currentLockScope().apply(copyAppend(lockPath, locateFromObjByName(prot.lockObj(), lockFunc)...), token.NoPos)
 				l.appendDeferredCall(canonicalPath(copyAppend(lockPath, locateFromObjByName(prot.lockObj(), unlockFunc)...)))
 			}
+
+			// Grant a lock-wrapper allowance when this method is the Lock/Unlock (or RLock/RUnlock) of a
+			// Locker type: such methods acquire or release a lock across the call boundary, which looks
+			// like a leak or an invalid unlock when analyzed in isolation. See lockScope.leakAllowance.
+			if recv := fnc.Signature().Recv(); recv != nil {
+				kind := lockKindOfObject(recv)
+				name := funcDecl.Name.Name
+				scope := l.currentLockScope()
+				if kind.isLocking(name) {
+					scope.leakAllowance = 1
+					scope.leakAllowanceRLock = name == "RLock" || name == "TryRLock"
+				} else if kind.isUnlocking(name) {
+					scope.invalidReleaseAllowance = 1
+				}
+			}
 		}
 	}
 
