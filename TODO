@@ -1,8 +1,0 @@
-Support index expressions.
-Support side effects for functions?
-pointer/value receiver
-Make read_protected_by / write_protected_by -> protect only reads by rlock/lock or writes by lock
-Support assignment graph for assignment.
-Catch uses in multiple go routines.
-Consider pointer/non-pointer referencing. What if functions reference outer such fields?
-Handle loop locking

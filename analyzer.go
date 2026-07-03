@@ -406,12 +406,12 @@ func (l *lockAnalyzer) analyzeCfg(stmt *ast.BlockStmt, onExit func()) {
 	processFrom = func(block *cfg.Block, idx int) {
 		for i := idx; i < len(block.Nodes); i++ {
 			nd := block.Nodes[i]
-			if funcLit, call, ok := stmtLevelInlineIIFE(nd); ok {
+			if funcLit, call, ok := stmtLevelInlineIife(nd); ok {
 				// Arguments are evaluated in the enclosing scope, before the call runs.
 				for _, arg := range call.Args {
 					l.analyzeExpr(arg)
 				}
-				l.decompressInlineIIFE(funcLit, func() {
+				l.decompressInlineIife(funcLit, func() {
 					processFrom(block, i+1)
 				})
 				return // The literal's exit paths own the continuation from here.
@@ -431,6 +431,16 @@ func (l *lockAnalyzer) analyzeCfg(stmt *ast.BlockStmt, onExit func()) {
 	}
 
 	visit = func(block *cfg.Block, scope *lockScope) {
+		// Don't evaluate unreachable blocks at all. go/cfg marks dead code (e.g. statements after a
+		// return) as not Live, and leaves it without an in-edge so the DFS never reaches it anyway.
+		// A default-less select that matches no case is the exception: go/cfg models it with a
+		// terminal "after case" block that is graph-reachable (Live) yet can never execute — the
+		// select blocks until a case is ready. Evaluating it would, for example, report a spurious
+		// leak for a lock that is released on every real path. Skip both.
+		if !block.Live || (block.Kind == cfg.KindSelectAfterCase && len(block.Succs) == 0) {
+			return
+		}
+
 		l.enterBlock(block)
 		l.enterDeferBranch()
 		l.enterLockScope(scope)
@@ -444,11 +454,11 @@ func (l *lockAnalyzer) analyzeCfg(stmt *ast.BlockStmt, onExit func()) {
 	visit(g.Blocks[0], l.currentLockScope().fork())
 }
 
-// stmtLevelInlineIIFE reports whether nd is a statement-level immediately-invoked function literal
+// stmtLevelInlineIife reports whether nd is a statement-level immediately-invoked function literal
 // (func(){ ... }() as its own expression statement), returning the literal and its call. Only this
 // form gets state-continuation treatment; literals nested inside larger expressions fall back to
 // isolated analysis in analyzeExpr.
-func stmtLevelInlineIIFE(nd ast.Node) (*ast.FuncLit, *ast.CallExpr, bool) {
+func stmtLevelInlineIife(nd ast.Node) (*ast.FuncLit, *ast.CallExpr, bool) {
 	exprStmt, ok := nd.(*ast.ExprStmt)
 	if !ok {
 		return nil, nil, false
@@ -464,13 +474,13 @@ func stmtLevelInlineIIFE(nd ast.Node) (*ast.FuncLit, *ast.CallExpr, bool) {
 	return funcLit, call, true
 }
 
-// decompressInlineIIFE analyzes a statement-level inline function literal as a compressed node in
+// decompressInlineIife analyzes a statement-level inline function literal as a compressed node in
 // the enclosing CFG. It analyzes the literal's body in a fresh leak frame (inheriting the current
 // held-lock state), and for each exit path of the literal it resumes the enclosing function via
 // continuation with the post-state: the literal's own defers run and its own-frame leaks are
 // reported at the literal, then its locals are pruned and the frame demoted to the enclosing one so
 // only locks on enclosing-scope variables flow onward.
-func (l *lockAnalyzer) decompressInlineIIFE(funcLit *ast.FuncLit, continuation func()) {
+func (l *lockAnalyzer) decompressInlineIife(funcLit *ast.FuncLit, continuation func()) {
 	owned := l.ownedBy(funcLit)
 
 	var seams []*lockScope

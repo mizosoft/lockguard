@@ -162,17 +162,8 @@ A lock that is still held when a function returns was acquired but never release
 
 ```go
 func (s *Server) leaksLock() {
-    s.mu.Lock()
+    s.mu.Lock() // 's.mu' acquired but never unlocked
     s.data++
-} // 's.mu' held at function exit (lock leak)
-
-func (s *Server) leaksOnEarlyReturn(cond bool) {
-    s.mu.Lock()
-    if cond {
-        return // 's.mu' held at function exit (lock leak) — defer would fix this
-    }
-    s.data++
-    s.mu.Unlock()
 }
 
 func (s *Server) noLeak() {
@@ -182,15 +173,26 @@ func (s *Server) noLeak() {
 }
 ```
 
-When the lock is only possibly held at exit — acquired on some paths but not released on all of them — the message says `possibly held`:
+A certain leak, every path out of the function holds the lock — is reported at the `Lock()` call that acquired it.
+
+When the lock is held on only *some* of the paths reaching the exit — acquired or released on a branch — the leak is uncertain and is reported at the closing brace as *may not be unlocked*:
 
 ```go
+func (s *Server) leaksOnEarlyReturn(cond bool) {
+    s.mu.Lock()
+    if cond {
+        return // leaves 's.mu' held; the other path unlocks it — a defer would fix this
+    }
+    s.data++
+    s.mu.Unlock()
+} // 's.mu' may not be unlocked at function exit
+
 func (s *Server) possiblyLeaks(cond bool) {
     if cond {
         s.mu.Lock()
     }
     s.data++ // writing 's.data' requires holding 's.mu' (not held on all paths)
-} // 's.mu' possibly held at function exit (possible lock leak)
+} // 's.mu' may not be unlocked at function exit
 ```
 
 ### Deadlock
@@ -205,14 +207,14 @@ func (s *Server) deadlock() {
 }
 ```
 
-When the lock is only possibly held on the current path, the diagnostic says `may be held` instead:
+When the lock is only possibly held on the current path, the diagnostic reports a possible deadlock instead:
 
 ```go
 func (s *Server) possibleDeadlock(cond bool) {
     if cond {
         s.mu.Lock()
     }
-    s.mu.Lock() // acquiring 's.mu' that may be held [deadlock]
+    s.mu.Lock() // acquiring 's.mu' may cause deadlock: may already be held
     defer s.mu.Unlock()
 }
 ```
