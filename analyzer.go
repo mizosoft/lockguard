@@ -364,20 +364,37 @@ func (l *lockAnalyzer) analyzeCfg(stmt *ast.BlockStmt, onExit func()) {
 						// Ignore.
 					}
 
-					// Apply Try[R]Lock() call results to the forked scope for the successor.
+					// Apply Try[R]Lock() call results to the forked scope for the successor. A Try-lock
+					// is non-blocking: it never deadlocks, so no acquire recorded here is a deadlock.
+					prune := false
 					for _, call := range tlCalls {
 						lockObjPath := call.path[:len(call.path)-1]
 						switch call.state {
 						case trueTryLockState:
+							// The success branch runs only when the lock was free, so it acquires the lock
+							// (never a deadlock). If the lock is already definitely held, TryLock would have
+							// returned false and this branch cannot execute, prune it rather than reporting
+							// a spurious deadlock.
 							result := forkedScope.lock(lockObjPath, call.isRLock, branchCond.Pos())
-							l.eventRecorder.recordAcquire(branchCond.Pos(), lockObjPath, call.isRLock, result.deadlock && result.uncertain, result.deadlock)
+							if result.deadlock && !result.uncertain {
+								prune = true
+							} else {
+								l.eventRecorder.recordAcquire(branchCond.Pos(), lockObjPath, call.isRLock, false, false)
+							}
 						case falseTryLockState:
 							// Lock not acquired; nothing to apply.
 						case unknownTryLockState:
-							result := forkedScope.lockUncertain(lockObjPath, call.isRLock, branchCond.Pos())
-							// Always uncertain: TryLock result is unknown, so the acquire may or may not have happened.
-							l.eventRecorder.recordAcquire(branchCond.Pos(), lockObjPath, call.isRLock, true, result.deadlock)
+							forkedScope.lockUncertain(lockObjPath, call.isRLock, branchCond.Pos())
+							// Always uncertain: the TryLock result is unknown, so the acquire may or may not
+							// have happened. It still never deadlocks.
+							l.eventRecorder.recordAcquire(branchCond.Pos(), lockObjPath, call.isRLock, true, false)
 						}
+					}
+
+					// The success branch is infeasible (lock already held); don't explore it, it is deadcode.
+					// Note this behavior derrives from the assumption that the lock implementation is correct.
+					if prune {
+						continue
 					}
 				}
 			}

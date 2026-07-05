@@ -184,14 +184,27 @@ func earlyReturnGuardTwoLocks() {
 	t.mu2.Unlock() // OK
 }
 
-// TryLocking a lock that is already held is a deadlock.
+// TryLock on an already-held lock returns false, it never blocks or deadlocks. So the inner
+// success branch is infeasible (the lock is definitely held from the outer TryLock): no deadlock is
+// reported and the branch body is unreachable on runtime.
 func doubleTryLock() {
 	var s S
 	if s.mut.TryLock() {
-		if s.mut.TryLock() { // want `acquiring 'mut' that is already held \[deadlock\]`
-			s.mut.Unlock()
+		if s.mut.TryLock() { // OK: returns false when already held, not a deadlock
+			s.mut.Unlock() // unreachable
 		}
 		s.i++
 		s.mut.Unlock()
 	}
+}
+
+// Lock() then TryLock() the same mutex, the pattern sync.Mutex's own tests use to probe TryLock.
+// TryLock returns false because the lock is held, so its success branch is infeasible: no deadlock.
+func lockThenTryLock() {
+	var s S
+	s.mut.Lock()
+	if s.mut.TryLock() { // OK: returns false when already held, not a deadlock
+		s.mut.Unlock() // unreachable
+	}
+	s.mut.Unlock()
 }
