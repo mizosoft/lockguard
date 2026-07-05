@@ -57,13 +57,3 @@ func anyMatch[E any](els []E, f func(e E) bool) bool {
 	}
 	return false
 }
-
-func matchCount[E any](els []E, f func(e E) bool) int {
-	cnt := 0
-	for _, e := range els {
-		if f(e) {
-			cnt++
-		}
-	}
-	return cnt
-}
