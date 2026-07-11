@@ -1,6 +1,27 @@
 
 # TODO
 
+## Performance
+
+### Exponential DFS on fall-through branch chains
+
+The DFS forks the lock scope at every branch and never re-merges at join points, so K sequential
+fall-through diamonds (an `if` whose arms rejoin) produce 2^K entry→exit paths. Measured: ~x4
+runtime per +2 branches; 26 diamonds ≈ 36s; real-world casualties include
+`crypto/tls.(*clientHelloMsg).marshalMsg` (~21 sequential per-extension ifs) and
+`encoding/json.(*decodeState).object` (57 branch points, only 19 terminating) — both reached via
+fact-driven dependency analysis of any non-trivial target, making the tool hang on effectively any
+real package. Branches that terminate (return/panic) do not multiply, which is why
+`reflect.StructOf` (131 blocks, panic-heavy) is fine.
+
+Pinned by `TestPathologicalCfg` (gated behind `LOCKGUARD_RUN_PATHOLOGICAL=1`; known-failing) over
+`testdata/src/pathological`. Drop the gate when the fix lands.
+
+Fix direction: memoize visits on (block, lock-state fingerprint) so identical states collapse at
+join blocks (lock-free functions become ~linear, path-sensitivity is kept where lock states truly
+differ), with a work budget as a backstop. The fingerprint must include pending deferred calls,
+which also affect downstream behavior.
+
 ## Correctness gaps
 
 ### Loop back-edge skipping
