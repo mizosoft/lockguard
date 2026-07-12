@@ -6,6 +6,7 @@ import (
 	"go/types"
 	"log"
 	"strings"
+	"time"
 
 	"golang.org/x/tools/go/analysis"
 	"golang.org/x/tools/go/analysis/passes/inspect"
@@ -18,6 +19,7 @@ import (
 // TODO we can also support once.Do patterns.
 
 var verbose bool
+var traceFuncs bool
 
 // Analyzer Checks lock-protected accesses and correct lock usage.
 var Analyzer = &analysis.Analyzer{
@@ -30,6 +32,8 @@ var Analyzer = &analysis.Analyzer{
 
 func init() {
 	Analyzer.Flags.BoolVar(&verbose, "verbose", false, "print internal CFG and lock-state debug output")
+	// -trace is taken by the driver's execution-trace flag.
+	Analyzer.Flags.BoolVar(&traceFuncs, "tracefuncs", false, "print a BEGIN/END line per analyzed function; a BEGIN without an END is a function the analysis never finished")
 }
 
 func run(pass *analysis.Pass) (interface{}, error) {
@@ -40,8 +44,8 @@ func run(pass *analysis.Pass) (interface{}, error) {
 	// they never contain lockguard annotations.
 	pkgPath := pass.Pkg.Path()
 	if pkgPath == "runtime" || strings.HasPrefix(pkgPath, "runtime/") ||
-		pkgPath == "internal" || strings.HasPrefix(pkgPath, "internal/") ||
-		pkgPath == "unsafe" {
+			pkgPath == "internal" || strings.HasPrefix(pkgPath, "internal/") ||
+			pkgPath == "unsafe" {
 		return nil, nil
 	}
 
@@ -244,6 +248,12 @@ func (l *lockAnalyzer) analyzeDecl(decl ast.Decl) {
 	case *ast.FuncDecl:
 		if decl.Body == nil {
 			return // External/declared-only function; no stmt.Body to analyze.
+		}
+
+		if traceFuncs {
+			start := time.Now()
+			log.Printf("BEGIN %s.%s", l.pass.Pkg.Path(), decl.Name.Name)
+			defer func() { log.Printf("END %s.%s (%v)", l.pass.Pkg.Path(), decl.Name.Name, time.Since(start)) }()
 		}
 
 		body := decl.Body

@@ -10,15 +10,23 @@ go build ./...
 go test ./...
 ```
 
-The only test is `TestAnalyzer`, which runs the analyis over all files in `testdata/src/a/` using the `analysistest` framework. Every expected diagnostic is declared with a `// want` comment on the relevant line; unexpected diagnostics also fail the test.
+The main test is `TestAnalyzer`, which runs the analysis over all files in `testdata/src/a/` using the `analysistest` framework. Every expected diagnostic is declared with a `// want` comment on the relevant line; unexpected diagnostics also fail the test.
 
-To enable verbose CFG/lock-state output during a test run:
+`TestPathologicalCfg` pins the known CFG path-explosion limitation over `testdata/src/pathological` (deliberately not part of package `a` — it would hang the suite). It is known-failing and gated behind `LOCKGUARD_RUN_PATHOLOGICAL=1`; drop the gate when the path-explosion fix lands.
+
+The analyzer runs on all packages except `runtime`, `internal`, and `unsafe` (see `run` in `analyzer.go`).
+
+### Debug flags
+
+Two analyzer flags (pass via `-args` under `go test`, or directly to the CLI):
+
+- `-verbose` — firehose: dumps every generated CFG and lock-state tree. For deep-dives into a single function's analysis; the output is huge and interleaves across parallel package workers, so don't trust "last printed" attribution.
+- `-tracefuncs` — lightweight progress trace: one `BEGIN`/`END` line (with duration) per analyzed function. To attribute a hang, find `BEGIN`s without a matching `END`; to find slow spots, sort the `END` durations.
 
 ```bash
 go test -run TestAnalyzer -args -verbose
+go build -o /tmp/lockguard ./cmd/lockguard && /tmp/lockguard -tracefuncs sync
 ```
-
-The analyzer is currently scoped to package `a` only (line 47 of `analyzer.go`). This is intentional while tests live in `testdata/src/a/`.
 
 ## Architecture
 
