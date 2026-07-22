@@ -177,7 +177,7 @@ func findStructObj(rootTyp *types.Struct, rootDef *types.Named, name string) can
 	q := make([]*types.Var, 0)
 
 	// This map serves a two-fold purpose: tracking visited fields so we don't endlessly follow
-	// cycles, and recording which fields led to which so we can construct the path.
+	// cycles, and recording which fields led to which so we can re-construct the path.
 	parent := make(map[*types.Var]*types.Var)
 
 	for field := range rootTyp.Fields() {

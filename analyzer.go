@@ -66,7 +66,6 @@ func run(pass *analysis.Pass) (interface{}, error) {
 			Category: string(diag.category),
 		})
 	}
-
 	return nil, nil
 }
 
@@ -102,8 +101,10 @@ type lockAnalyzer struct {
 	deferredCallsStack [][][]any
 }
 
-// ownedAll is the ownership predicate for a top-level function exit: every held lock is reported.
-func ownedAll(types.Object) bool { return true }
+// ownsAll is the ownership predicate for a top-level function exit: every held lock is reported.
+func ownsAll(types.Object) bool {
+	return true
+}
 
 // ownedBy returns the ownership predicate for an inline function literal exit: a root variable
 // belongs to the literal iff it is declared lexically inside it. This is decided by scope identity
@@ -259,7 +260,7 @@ func (l *lockAnalyzer) analyzeDecl(decl ast.Decl) {
 		body := decl.Body
 		l.enterNewLockScope()
 		l.analyzeCfg(body, func() {
-			l.processExitDeferred(body.Rbrace, ownedAll)
+			l.processExitDeferred(body.Rbrace, ownsAll)
 		})
 		l.exitLockScope()
 	case *ast.GenDecl:
@@ -776,7 +777,7 @@ func (l *lockAnalyzer) analyzeExpr(expr ast.Expr) {
 			// Callback / goroutine literal: executes in an unknown context, so start from an empty scope.
 			// Every lock it holds at exit is its own leak.
 			l.enterNewLockScope()
-			owned = ownedAll
+			owned = ownsAll
 		}
 		l.analyzeCfg(expr.Body, func() {
 			l.processExitDeferred(expr.Body.Rbrace, owned)
