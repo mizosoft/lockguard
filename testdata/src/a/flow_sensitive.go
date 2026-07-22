@@ -523,19 +523,6 @@ func (l *loopCondition) lockBeforeLoop() {
 }
 
 // ============================================================================
-// Conditional compilation / build tags (if supported)
-// ============================================================================
-
-type platformSpecific struct {
-	x  int `protected_by:"mu"`
-	mu sync.Mutex
-}
-
-func (p *platformSpecific) linuxOnly() {
-	p.x++ // want `writing 'p\.x' requires holding 'p\.mu'`
-}
-
-// ============================================================================
 // Anonymous struct fields
 // ============================================================================
 
