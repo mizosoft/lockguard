@@ -3,24 +3,32 @@
 
 ## Performance
 
-### Exponential DFS on fall-through branch chains
+### Exponential DFS on fall-through branch chains — FIXED (memoization)
 
-The DFS forks the lock scope at every branch and never re-merges at join points, so K sequential
-fall-through diamonds (an `if` whose arms rejoin) produce 2^K entry→exit paths. Measured: ~x4
-runtime per +2 branches; 26 diamonds ≈ 36s; real-world casualties include
-`crypto/tls.(*clientHelloMsg).marshalMsg` (~21 sequential per-extension ifs) and
-`encoding/json.(*decodeState).object` (57 branch points, only 19 terminating) — both reached via
-fact-driven dependency analysis of any non-trivial target, making the tool hang on effectively any
-real package. Branches that terminate (return/panic) do not multiply, which is why
-`reflect.StructOf` (131 blocks, panic-heavy) is fine.
+**Was:** the DFS forks the lock scope at every branch and never re-merged at join points, so K
+sequential fall-through diamonds produced 2^K entry→exit paths (~x4 runtime per +2 branches;
+26 diamonds ≈ 36s). Real-world casualties `crypto/tls.(*clientHelloMsg).marshalMsg` and
+`encoding/json.(*decodeState).object`, reached via fact-driven dependency analysis of any target,
+made the tool hang on effectively any real package (`expvar` never terminated).
 
-Pinned by `TestPathologicalCfg` (gated behind `LOCKGUARD_RUN_PATHOLOGICAL=1`; known-failing) over
-`testdata/src/pathological`. Drop the gate when the fix lands.
+**Fix (`memo.go`):** memoize each visit on `(block, fingerprint(state))`. A repeated pair
+reproduces the first traversal exactly, contributing only event multiplicity, which the ∀/∃-style
+gather pass is insensitive to — so deduplication is observationally invisible (verified: `sync`
+diagnostics byte-identical pre/post). Sound only for blocks of *reducible* SCCs; blocks of
+*irreducible* SCCs (multi-entry cycles, goto-only) are never memoized, because there the future
+also depends on which cycle-mates are on the DFS stack. Irreducibility is detected per-SCC via a
+retreating-edge-vs-back-edge test over dominators + Tarjan SCCs. See the design note
+(`~/Desktop/lockguard-memoization-scc.pdf`).
 
-Fix direction: memoize visits on (block, lock-state fingerprint) so identical states collapse at
-join blocks (lock-free functions become ~linear, path-sensitivity is kept where lock states truly
-differ), with a work budget as a backstop. The fingerprint must include pending deferred calls,
-which also affect downstream behavior.
+Results: 26-diamond chain 36s → 0.02s (flat to N=30); `expvar` hang → 0.38s; `crypto/tls` and
+`encoding/json` sub-second. `TestPathologicalCfg` is now ungated and passes in ~0.2s;
+`testdata/src/a/irreducible.go` pins that irreducible SCCs keep full path enumeration (both its
+diagnostics vanish if the gate is disabled).
+
+**Remaining backstop (future):** legitimate state proliferation can still be super-linear (e.g.
+long `TryLock` ladders where each diamond genuinely changes the lock tree), and adversarial
+irreducible `goto` regions retain path enumeration. A per-function work budget that degrades
+gracefully past a cap is the intended safety net; not yet implemented.
 
 ## Correctness gaps
 

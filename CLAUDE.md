@@ -12,7 +12,7 @@ go test ./...
 
 The main test is `TestAnalyzer`, which runs the analysis over all files in `testdata/src/a/` using the `analysistest` framework. Every expected diagnostic is declared with a `// want` comment on the relevant line; unexpected diagnostics also fail the test.
 
-`TestPathologicalCfg` pins the known CFG path-explosion limitation over `testdata/src/pathological` (deliberately not part of package `a` — it would hang the suite). It is known-failing and gated behind `LOCKGUARD_RUN_PATHOLOGICAL=1`; drop the gate when the path-explosion fix lands.
+`TestPathologicalCfg` guards against CFG path explosion over `testdata/src/pathological` (deliberately not part of package `a`, to keep the fall-through chains isolated). It bounds the run with a 10s deadline; the memoization fix (see below) keeps it well under that.
 
 The analyzer runs on all packages except `runtime`, `internal`, and `unsafe` (see `run` in `analyzer.go`).
 
@@ -36,6 +36,12 @@ go build -o /tmp/lockguard ./cmd/lockguard && /tmp/lockguard -tracefuncs sync
 2. **Gather pass** (`gatherDiagnostics` in `event.go`): aggregates events grouped by `(pos, pathCode)` across all DFS paths and emits diagnostics.
 
 **Why DFS over BFS/topological sort:** BFS merges lock states at join blocks, losing per-path information needed to correctly replay deferred functions at each exit point and to distinguish "definitely held" from "possibly held".
+
+### Visit memoization (`memo.go`)
+
+Naive path enumeration is exponential on fall-through branch chains (K diamonds → 2^K paths). Each `visit` is memoized on `(block, fingerprint(state))`: a repeated pair reproduces the first traversal exactly, contributing only event multiplicity, and the ∀/∃-style gather pass is insensitive to multiplicity — so deduplication never changes diagnostics. `fingerprint` (in `memo.go`) canonically serializes the lock tree (nonzero nodes, sorted, with counters + `acquirePos`), the pending defer stack (LIFO), and the wrapper allowances. The table (`explored`) is scoped to each `analyzeCfg` invocation.
+
+Memoization is **gated by reducibility**: it is sound only for blocks in reducible SCCs. Inside an irreducible SCC (a multi-entry cycle, constructible only via `goto`) the traversal from `(block, state)` also depends on which cycle-mates are on the DFS stack, so those blocks are never memoized. `computeCfgInfo` marks them via dominators + Tarjan SCCs + a retreating-edge-that-isn't-a-back-edge test. Full derivation and proofs: `~/Desktop/lockguard-memoization-scc.pdf`.
 
 ### Lock scope tree (`scope.go`)
 

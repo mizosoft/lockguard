@@ -284,6 +284,13 @@ func (l *lockAnalyzer) analyzeCfg(stmt *ast.BlockStmt, onExit func()) {
 		log.Println("Generated CFG block", "\n`", g.Format(l.pass.Fset), "`")
 	}
 
+	// Structural facts and the visit-memoization table for this CFG. The table is scoped to this
+	// analyzeCfg invocation: cfg.New builds fresh blocks each call, deferred-literal re-entries
+	// get their own tables, and inline-IIFE decompression continuations run under this closure so
+	// they correctly share this one.
+	info := computeCfgInfo(g)
+	explored := make(map[memoKey]struct{})
+
 	// Each CFG analysis (a function body or a function literal) is its own defer scope. The base
 	// branch holds function-level deferred calls (e.g. annotation-injected unlocks); each visited
 	// CFG block pushes its own branch on top so per-block defers can be popped on DFS backtrack.
@@ -456,6 +463,21 @@ func (l *lockAnalyzer) analyzeCfg(stmt *ast.BlockStmt, onExit func()) {
 		// leak for a lock that is released on every real path. Skip both.
 		if !block.Live || (block.Kind == cfg.KindSelectAfterCase && len(block.Succs) == 0) {
 			return
+		}
+
+		// Memoize on (block, entry state): a repeated pair reproduces the first traversal
+		// exactly, contributing only event multiplicity, which the gather pass is insensitive
+		// to. This collapses the 2^K path enumeration over fall-through branch chains to one
+		// visit per distinct state. Sound only for blocks of reducible SCCs — inside an
+		// irreducible (multi-entry, goto-made) SCC the future also depends on which cycle-mates
+		// are on the DFS stack, so those blocks are always visited. See memo.go. The fingerprint
+		// must be taken here, before this visit pushes its own defer branch.
+		if !info.irreducible[block.Index] {
+			key := memoKey{block, l.fingerprint(scope)}
+			if _, ok := explored[key]; ok {
+				return
+			}
+			explored[key] = struct{}{}
 		}
 
 		l.enterBlock(block)
